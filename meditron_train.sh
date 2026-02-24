@@ -44,15 +44,8 @@ if [ -z "$SLURM_JOB_ID" ]; then
     JOB_ID=$(echo "$SUBMISSION_OUTPUT" | awk '{print $4}')
     echo "🚀 Submitted Job: $JOB_ID"
 
-    MODEL_PATH="$(
-python3 - <<'PY' "$DEST_CFG"
-import sys, yaml
-cfg_path = sys.argv[1]
-with open(cfg_path, "r", encoding="utf-8") as f:
-    cfg = yaml.safe_load(f)
-print(cfg.get("output_dir","").strip())
-PY
-)"
+    # Avoid bash here-doc temp files (can fail if shared /tmp has no space/inodes).
+    MODEL_PATH="$(python3 -c 'import sys, yaml; cfg=yaml.safe_load(open(sys.argv[1], "r", encoding="utf-8")) or {}; print((cfg.get("output_dir", "") or "").strip())' "$DEST_CFG")"
     if [ -z "$MODEL_PATH" ]; then
     echo "❌ Could not read output_dir from $DEST_CFG"
     exit 1
