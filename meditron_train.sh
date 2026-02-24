@@ -124,7 +124,7 @@ if ! declare -F slack_notify >/dev/null 2>&1; then
 fi
 
 # 3. Define Scratch Paths (Do NOT export TMPDIR yet!)
-JOB_SCRATCH_BASE=${TMPDIR_BASE:-/iopsstor/scratch/cscs/theimer/axolotl-cache}
+JOB_SCRATCH_BASE=${TMPDIR_BASE:-/iopsstor/scratch/cscs/$USER/axolotl-cache}
 mkdir -p $JOB_SCRATCH_BASE
 JOB_SCRATCH="$JOB_SCRATCH_BASE/${SLURM_JOB_ID:-nojob}"
 LOCAL_TMP="$JOB_SCRATCH/tmp"
@@ -138,7 +138,7 @@ mkdir -p "$LOCAL_TMP" "$LOCAL_HF" "$LOCAL_DS" "$LOCAL_TRITON" "$LOCAL_WANDB"
 # Added: -A and --reservation to match the main job parameters
 echo "🛠️  Pre-creating scratch directories on all $SLURM_NNODES nodes..."
 
-export TMPDIR=/iopsstor/scratch/cscs/theimer/tmp
+export TMPDIR=/iopsstor/scratch/cscs/$USER/tmp
 mkdir -p "$TMPDIR"
 srun --ntasks-per-node=1 \
      --cpus-per-task=1 \

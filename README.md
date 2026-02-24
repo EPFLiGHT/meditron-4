@@ -8,8 +8,7 @@ Axolotl configs and Slurm helpers for training/evaluating of Meditron models on 
 - Clone of the lm-evaluation-harness fork alongside this repo: `git clone https://github.com/Xkrilandar/lm-evaluation-harness`.
 
 ## Environment setup
-1. Create a `.env` in the repo root with your paths and tokens (do not commit secrets), following the `.env.example` format:
-2. Log in to CSCS and load your environment (quick commands live in `setup.md` and `script_login.bash`).
+Create a `.env` in the repo root with your paths and tokens (do not commit secrets), following the `.env.example` format:
 
 ## Training
 - Pick a config in `axolotl_config/` (e.g., `apertus-8b-only-mediset.yaml`, `apertus-8b-ablation-no-mediset.yaml`, `apertus-70b.yaml`).
