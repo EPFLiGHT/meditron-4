@@ -2,7 +2,7 @@
 #SBATCH --job-name meditron-default-job
 #SBATCH --output train_reports/R-%x.%j.err
 #SBATCH --error train_reports/R-%x.%j.err
-#SBATCH --nodes 32
+#SBATCH --nodes 8
 #SBATCH --ntasks-per-node 1
 #SBATCH --gres gpu:4
 #SBATCH --cpus-per-task 288

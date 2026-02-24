@@ -1,0 +1,94 @@
+# ========================
+# Model & Paths
+# ========================
+base_model: $STORAGE_ROOT/apertus/huggingface/meta-llama/Llama-3.1-8B-Instruct
+
+output_dir: $STORAGE_ROOT/meditron/models/meditron-3-8b-dpo-5e-7-32x4x16
+
+dataset_prepared_path: $USER_STORAGE/prepared/meditron-3-8b-dpo-5e-7-32x4x16
+load_prepared_dataset: true
+
+wandb_name: meditron-3-8b-dpo-5e-7-32x4x16
+
+# ========================
+# Hardware & Speed
+# ========================
+deepspeed: $PROJECT_ROOT/axolotl_config/deepspeed_zero_3.json
+bf16: true
+tf32: false
+tf16: false
+flash_attention: true
+flash_attn_rms_norm: true
+flash_attn_fuse_qkv: false
+xformers_attention: null
+strict: false
+use_cache: false
+
+# ========================
+# DPO
+# ========================
+rl: dpo
+sequence_len: 4096
+sample_packing: false
+pad_to_sequence_len: true
+group_by_length: false
+
+datasets:
+  - path: data_preprocessing/dpo_dataset_clean.jsonl
+    ds_type: json
+    type: user_defined.default
+    field_prompt: prompt
+    field_chosen: chosen
+    field_rejected: rejected
+
+dataset_processes: 32
+shuffle_merged_datasets: true
+
+# ========================
+# Training Hyperparameters
+# ========================
+type: LlamaForCausalLM
+tokenizer_type: AutoTokenizer
+
+num_epochs: 1
+micro_batch_size: 4
+gradient_accumulation_steps: 1
+max_grad_norm: 1.0
+
+# ========================
+# Optimization
+# ========================
+optimizer: adamw_torch
+optim_args:
+  fused: true
+learning_rate: 5e-7
+lr_scheduler: cosine
+cosine_min_lr_ratio: 0.1
+warmup_ratio: 0.0
+weight_decay: 0.05
+
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+# ========================
+# Quantization (Disabled)
+# ========================
+load_in_4bit: false
+load_in_8bit: false
+
+# ========================
+# Logging & Evaluation
+# ========================
+logging_steps: 1
+saves_per_epoch: 1
+evals_per_epoch: 0
+eval_set_size: 0.0
+eval_table_size: null
+early_stopping_patience: null
+
+wandb_project: $WANDB_PROJECT
+wandb_entity: $WANDB_ENTITY
+
+special_tokens:
+  pad_token: <|end_of_text|>
