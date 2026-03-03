@@ -12,3 +12,7 @@ script_login.bash
 axolotl_config/config.yaml
 axolotl_config/generated
 scripts/python/
+distill_reports
+__pycache__
+distillation/distilled_outputs
+distillation/distill_reports

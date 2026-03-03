@@ -1,0 +1,11 @@
+bash meditron_distill_pool_submit.sh datasets_to_distill.txt \
+  --model google/medgemma-27b-text-it \
+  --strict-repro \
+  --deterministic \
+  --seed 42 \
+  --model-revision "${DISTILL_MODEL_REVISION:?set DISTILL_MODEL_REVISION}" \
+  --num-workers 4 \
+  --request-concurrency 8 \
+  --max-retries-per-shard 2 \
+  --lease-timeout-seconds 7200 \
+  --worker-time-limit 05:59:59

@@ -11,10 +11,10 @@ Axolotl configs and Slurm helpers for training/evaluating of Meditron models on 
 Create a `.env` in the repo root with your paths and tokens (do not commit secrets), following the `.env.example` format:
 
 ## Training
-- Pick a config in `axolotl_config/` (e.g., `apertus-8b-only-mediset.yaml`, `apertus-8b-ablation-no-mediset.yaml`, `apertus-70b.yaml`).
+- Pick a config in `axolotl_config/` (for Meditron-4/Qwen-3 use `sft_meditron4_qwen3.yaml`).
 - Submit via Slurm (self-submits and tails logs):
   ```
-  bash meditron_train.sh axolotl_config/apertus-8b-only-mediset.yaml
+  bash meditron_train.sh axolotl_config/sft_meditron4_qwen3.yaml
   ```
   The script:
   - injects your `.env` values into the template and writes `axolotl_config/config.yaml`,
@@ -25,7 +25,7 @@ Create a `.env` in the repo root with your paths and tokens (do not commit secre
 ## Script usage
 - `meditron_train.sh`: submit a training run.
   ```
-  bash train.sh axolotl_config/apertus-8b-only-mediset.yaml
+  bash train.sh axolotl_config/sft_meditron4_qwen3.yaml
   ```
 - `meditron_eval.sh`: submit an eval run (data parallel via accelerate).
   ```
@@ -44,3 +44,55 @@ Create a `.env` in the repo root with your paths and tokens (do not commit secre
   bash find_training_errors.sh
   ```
 - `slack_helpers.sh`: helper functions for other scripts (not meant to be run directly).
+
+## Distillation
+From the `distillation/` directory:
+
+1. Export immutable model revisions for provenance:
+   ```bash
+   export DISTILL_MODEL_REVISION=<medgemma_revision_or_commit>
+   export JUDGE_MODEL_REVISION=<medgemma_revision_or_commit>
+   ```
+2. Prepare dataset caches:
+   ```bash
+   python3 prepare_distill_datasets.py datasets_to_distill.txt
+   ```
+3. Submit deterministic strict-repro shard jobs (defaults to `google/medgemma-27b-text-it`):
+   ```bash
+   bash meditron_distill_submit.sh datasets_to_distill.txt \
+     --strict-repro \
+     --deterministic \
+     --seed 42 \
+     --model-revision "$DISTILL_MODEL_REVISION"
+   ```
+4. Merge shard outputs and validate reproducibility manifests:
+   ```bash
+   python3 merge_distilled_shards.py \
+     --list-file datasets_to_distill.txt \
+     --model google/medgemma-27b-text-it \
+     --strict-repro
+   ```
+5. Build final curated Meditron-4 mixture:
+   ```bash
+   python3 build_meditron4_mixture.py \
+     --list-file datasets_to_distill.txt \
+     --distill-model google/medgemma-27b-text-it \
+     --judge-model google/medgemma-27b-text-it \
+     --max-attempts 5 \
+     --strict-repro \
+     --deterministic \
+     --seed 42 \
+     --distill-model-revision "$DISTILL_MODEL_REVISION" \
+     --judge-model-revision "$JUDGE_MODEL_REVISION" \
+     --version "$(date -u +%Y%m%d)"
+   ```
+   Outputs:
+   - `curated_mixtures/meditron4_mixture_<version>.jsonl`
+   - `curated_mixtures/meditron4_mixture_<version>.manifest.json`
+   - `curated_mixtures/meditron4_mixture_<version>_unresolved_labeled.jsonl`
+
+### Reproducibility guarantees
+- `--strict-repro` enforces seeded runs and required model revision provenance.
+- Distillation workers store per-row `distilled_config_sha256` and `distilled_repro`.
+- Shard and merged outputs emit manifest files with hashes/provenance.
+- Curation writes dataset checksums, config hash, git commit SHA, attempt stats, and unresolved labeled rows.
