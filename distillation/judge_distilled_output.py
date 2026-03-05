@@ -12,7 +12,19 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from distill_common import DEFAULT_LIST_FILE, load_dataset_paths
+DEFAULT_LIST_FILE = "datasets_to_distill.txt"
+
+
+def load_dataset_paths(list_file):
+    list_path = Path(list_file).expanduser().resolve()
+    paths = []
+    with list_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            paths.append(Path(line).expanduser().resolve())
+    return paths
 
 LABEL_KEYS = ("true_label", "true_answer_text", "label", "answer")
 VALID_STATUSES = {"pass", "fail", "unknown"}

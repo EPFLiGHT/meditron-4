@@ -1,4 +1,4 @@
-bash meditron_distill_pool_submit.sh datasets_to_distill.txt \
+bash distill_head.sh datasets_to_distill.txt \
   --model google/medgemma-27b-text-it \
   --strict-repro \
   --deterministic \

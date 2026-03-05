@@ -13,7 +13,30 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, Optional
 
-from distill_common import DEFAULT_LIST_FILE, final_output_path, load_dataset_paths
+DEFAULT_LIST_FILE = "datasets_to_distill.txt"
+
+
+def load_dataset_paths(list_file):
+    list_path = Path(list_file).expanduser().resolve()
+    paths = []
+    with list_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            paths.append(Path(line).expanduser().resolve())
+    return paths
+
+
+def model_tag(model: str) -> str:
+    raw = (model or "").strip().lower()
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw).strip("._-")
+    return safe or "model"
+
+
+def final_output_path(dataset_path, model):
+    src = Path(dataset_path)
+    return src.with_name(f"{src.stem}_distillation_{model_tag(model)}.jsonl")
 
 LABEL_KEYS = ("true_label", "true_answer_text", "label", "answer")
 

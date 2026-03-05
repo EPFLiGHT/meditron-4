@@ -46,53 +46,19 @@ Create a `.env` in the repo root with your paths and tokens (do not commit secre
 - `slack_helpers.sh`: helper functions for other scripts (not meant to be run directly).
 
 ## Distillation
-From the `distillation/` directory:
+Quickstart (from repo root):
 
-1. Export immutable model revisions for provenance:
-   ```bash
-   export DISTILL_MODEL_REVISION=<medgemma_revision_or_commit>
-   export JUDGE_MODEL_REVISION=<medgemma_revision_or_commit>
-   ```
-2. Prepare dataset caches:
-   ```bash
-   python3 prepare_distill_datasets.py datasets_to_distill.txt
-   ```
-3. Submit deterministic strict-repro shard jobs (defaults to `google/medgemma-27b-text-it`):
-   ```bash
-   bash meditron_distill_submit.sh datasets_to_distill.txt \
-     --strict-repro \
-     --deterministic \
-     --seed 42 \
-     --model-revision "$DISTILL_MODEL_REVISION"
-   ```
-4. Merge shard outputs and validate reproducibility manifests:
-   ```bash
-   python3 merge_distilled_shards.py \
-     --list-file datasets_to_distill.txt \
-     --model google/medgemma-27b-text-it \
-     --strict-repro
-   ```
-5. Build final curated Meditron-4 mixture:
-   ```bash
-   python3 build_meditron4_mixture.py \
-     --list-file datasets_to_distill.txt \
-     --distill-model google/medgemma-27b-text-it \
-     --judge-model google/medgemma-27b-text-it \
-     --max-attempts 5 \
-     --strict-repro \
-     --deterministic \
-     --seed 42 \
-     --distill-model-revision "$DISTILL_MODEL_REVISION" \
-     --judge-model-revision "$JUDGE_MODEL_REVISION" \
-     --version "$(date -u +%Y%m%d)"
-   ```
-   Outputs:
-   - `curated_mixtures/meditron4_mixture_<version>.jsonl`
-   - `curated_mixtures/meditron4_mixture_<version>.manifest.json`
-   - `curated_mixtures/meditron4_mixture_<version>_unresolved_labeled.jsonl`
+```bash
+bash distillation/distill_head.sh distillation/datasets_to_distill.txt \
+  --strict-repro \
+  --deterministic \
+  --seed 42 \
+  --model-revision "$DISTILL_MODEL_REVISION"
+```
 
-### Reproducibility guarantees
-- `--strict-repro` enforces seeded runs and required model revision provenance.
-- Distillation workers store per-row `distilled_config_sha256` and `distilled_repro`.
-- Shard and merged outputs emit manifest files with hashes/provenance.
-- Curation writes dataset checksums, config hash, git commit SHA, attempt stats, and unresolved labeled rows.
+Outputs and logs:
+- Run state: `distill_reports/pool-<model>-<timestamp>-<rid>/` (`queue.db`, summary, events)
+- Distilled shards: alongside each source dataset as `*_distillation_<model>.shard-*.jsonl`
+- Merged outputs: alongside each source dataset as `*_distillation_<model>.jsonl`
+
+See `distillation/README.md` for full details, environment variables, and queue layout.
