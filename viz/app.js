@@ -1,7 +1,7 @@
 (() => {
   const ID_KEYS = ["id", "example_id", "uid", "uuid", "record_id"];
-  const QUESTION_KEYS = ["question", "prompt", "input", "query"];
-  const ANSWER_KEYS = ["answer", "response", "output", "completion", "text", "chosen", "assistant"];
+  const QUESTION_KEYS = ["question", "prompt", "input", "query", "instruction", "question_text", "user_prompt"];
+  const ANSWER_KEYS = ["answer", "response", "output", "completion", "text", "chosen", "assistant", "final", "assistant_response"];
 
   const state = {
     comparisons: [],
@@ -18,6 +18,7 @@
     loadBtn: document.getElementById("load-btn"),
     prevBtn: document.getElementById("prev-btn"),
     nextBtn: document.getElementById("next-btn"),
+    randomBtn: document.getElementById("random-btn"),
     jumpInput: document.getElementById("jump-input"),
     counter: document.getElementById("counter"),
     status: document.getElementById("status"),
@@ -45,8 +46,15 @@
       els.errors.textContent = "";
       return;
     }
+    const MAX_MESSAGES = 50;
+    const shown = messages.slice(0, MAX_MESSAGES);
+    const hiddenCount = Math.max(0, messages.length - shown.length);
+
     els.errors.classList.add("visible");
-    els.errors.innerHTML = messages.map((msg) => `<div>${escapeHtml(msg)}</div>`).join("");
+    els.errors.innerHTML = shown.map((msg) => `<div>${escapeHtml(msg)}</div>`).join("");
+    if (hiddenCount > 0) {
+      els.errors.innerHTML += `<div>... and ${hiddenCount} more warnings</div>`;
+    }
   }
 
   function setStatus(text, isWarning = false) {
@@ -133,6 +141,8 @@
 
     let question = null;
     let answer = null;
+    let firstNonAssistant = null;
+    let lastAnyText = null;
 
     for (const turn of turns) {
       if (!turn || typeof turn !== "object") {
@@ -145,6 +155,11 @@
       if (!text) {
         continue;
       }
+      lastAnyText = text;
+
+      if (!firstNonAssistant && role !== "assistant" && role !== "model" && role !== "gpt") {
+        firstNonAssistant = text;
+      }
 
       if (!question && (role === "user" || role === "human")) {
         question = text;
@@ -153,6 +168,13 @@
         // Use the latest assistant response if multiple exist.
         answer = text;
       }
+    }
+
+    if (!question && firstNonAssistant) {
+      question = firstNonAssistant;
+    }
+    if (!answer && lastAnyText) {
+      answer = lastAnyText;
     }
 
     if (!question || !answer) {
@@ -167,9 +189,11 @@
     const lines = text.split(/\r?\n/);
     const recordsById = new Map();
     const errors = [];
+    const duplicateSamples = [];
     let missingIdCount = 0;
     let missingQuestionCount = 0;
     let missingAnswerCount = 0;
+    let duplicateIdCount = 0;
 
     for (let i = 0; i < lines.length; i += 1) {
       const raw = lines[i].trim();
@@ -214,7 +238,10 @@
 
       const id = idHit.value;
       if (recordsById.has(id)) {
-        errors.push(`${sideLabel}: duplicate id '${id}' (line ${i + 1}) - keeping first`);
+        duplicateIdCount += 1;
+        if (duplicateSamples.length < 10) {
+          duplicateSamples.push(`${id} (line ${i + 1})`);
+        }
         continue;
       }
 
@@ -233,6 +260,8 @@
         missingIdCount,
         missingQuestionCount,
         missingAnswerCount,
+        duplicateIdCount,
+        duplicateSamples,
         parsedCount: recordsById.size
       }
     };
@@ -273,6 +302,7 @@
   function setNavigationEnabled(enabled) {
     els.prevBtn.disabled = !enabled;
     els.nextBtn.disabled = !enabled;
+    els.randomBtn.disabled = !enabled;
     els.jumpInput.disabled = !enabled;
     if (!enabled) {
       els.jumpInput.value = "";
@@ -398,6 +428,14 @@
     if (parsedB.stats.missingAnswerCount > 0) {
       warnings.push(`File B: ${parsedB.stats.missingAnswerCount} rows skipped (missing answer key)`);
     }
+    if (parsedA.stats.duplicateIdCount > 0) {
+      const sample = parsedA.stats.duplicateSamples.join(", ");
+      warnings.push(`File A: ${parsedA.stats.duplicateIdCount} duplicate IDs skipped (keeping first). Examples: ${sample}`);
+    }
+    if (parsedB.stats.duplicateIdCount > 0) {
+      const sample = parsedB.stats.duplicateSamples.join(", ");
+      warnings.push(`File B: ${parsedB.stats.duplicateIdCount} duplicate IDs skipped (keeping first). Examples: ${sample}`);
+    }
 
     state.comparisons = comparisons;
     state.currentIndex = 0;
@@ -430,6 +468,23 @@
     renderCurrent();
   }
 
+  function goToRandom() {
+    const total = state.comparisons.length;
+    if (!total) {
+      return;
+    }
+    if (total === 1) {
+      goToIndex(0);
+      return;
+    }
+
+    let next = state.currentIndex;
+    while (next === state.currentIndex) {
+      next = Math.floor(Math.random() * total);
+    }
+    goToIndex(next);
+  }
+
   els.loadBtn.addEventListener("click", () => {
     loadAndCompare();
   });
@@ -440,6 +495,10 @@
 
   els.nextBtn.addEventListener("click", () => {
     goToIndex(state.currentIndex + 1);
+  });
+
+  els.randomBtn.addEventListener("click", () => {
+    goToRandom();
   });
 
   els.jumpInput.addEventListener("change", () => {
