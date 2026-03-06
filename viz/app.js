@@ -89,6 +89,50 @@
     return null;
   }
 
+  function pickScalarValue(obj, keys) {
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+        continue;
+      }
+      const value = obj[key];
+      if (value === null || value === undefined) {
+        continue;
+      }
+      if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (trimmed) {
+          return trimmed;
+        }
+        continue;
+      }
+      if (typeof value === "number" || typeof value === "boolean") {
+        return String(value);
+      }
+    }
+    return null;
+  }
+
+  function buildSourceKey(row) {
+    const path = pickScalarValue(row, [
+      "distilled_source_path",
+      "source_path",
+      "dataset_path",
+      "original_source_path",
+      "source_file"
+    ]);
+    const index = pickScalarValue(row, [
+      "distilled_source_index",
+      "source_index",
+      "index",
+      "row_index",
+      "example_index"
+    ]);
+    if (!path || !index) {
+      return null;
+    }
+    return `${path}::${index}`;
+  }
+
   function extractTextContent(value) {
     if (value === null || value === undefined) {
       return null;
@@ -247,6 +291,7 @@
 
       recordsById.set(id, {
         id,
+        sourceKey: buildSourceKey(row),
         question,
         answer,
         sourceLine: i + 1
@@ -350,12 +395,61 @@
     const idsA = new Set(parsedA.recordsById.keys());
     const idsB = new Set(parsedB.recordsById.keys());
 
-    const sharedIds = [...idsA].filter((id) => idsB.has(id)).sort((x, y) => x.localeCompare(y));
+    const sharedIds = [...idsA].filter((id) => idsB.has(id));
 
-    const comparisons = sharedIds.map((id) => {
+    const sourceMapA = new Map();
+    const sourceMapB = new Map();
+
+    for (const rec of parsedA.recordsById.values()) {
+      if (rec.sourceKey && !sourceMapA.has(rec.sourceKey)) {
+        sourceMapA.set(rec.sourceKey, rec);
+      }
+    }
+    for (const rec of parsedB.recordsById.values()) {
+      if (rec.sourceKey && !sourceMapB.has(rec.sourceKey)) {
+        sourceMapB.set(rec.sourceKey, rec);
+      }
+    }
+
+    const sourceKeysA = new Set(sourceMapA.keys());
+    const sourceKeysB = new Set(sourceMapB.keys());
+    const sharedSourceKeys = [...sourceKeysA].filter((key) => sourceKeysB.has(key));
+
+    const minParsed = Math.max(1, Math.min(parsedA.stats.parsedCount, parsedB.stats.parsedCount));
+    const idCoverage = sharedIds.length / minParsed;
+
+    let strategy = "id";
+    if (sharedSourceKeys.length > sharedIds.length && idCoverage < 0.25) {
+      strategy = "source";
+    }
+
+    if (strategy === "source") {
+      const keys = sharedSourceKeys.sort((x, y) => x.localeCompare(y));
+      const comparisons = keys.map((key) => {
+        const a = sourceMapA.get(key);
+        const b = sourceMapB.get(key);
+        const displayId = a.id || b.id || key;
+        return {
+          id: displayId,
+          question: a.question,
+          answerA: a.answer,
+          answerB: b.answer
+        };
+      });
+      return {
+        strategy,
+        sharedById: sharedIds.length,
+        sharedBySource: sharedSourceKeys.length,
+        comparisons,
+        unmatchedA: sourceMapA.size - keys.length,
+        unmatchedB: sourceMapB.size - keys.length
+      };
+    }
+
+    const keys = sharedIds.sort((x, y) => x.localeCompare(y));
+    const comparisons = keys.map((id) => {
       const a = parsedA.recordsById.get(id);
       const b = parsedB.recordsById.get(id);
-
       return {
         id,
         question: a.question,
@@ -363,11 +457,13 @@
         answerB: b.answer
       };
     });
-
     return {
+      strategy,
+      sharedById: sharedIds.length,
+      sharedBySource: sharedSourceKeys.length,
       comparisons,
-      unmatchedA: [...idsA].filter((id) => !idsB.has(id)).length,
-      unmatchedB: [...idsB].filter((id) => !idsA.has(id)).length
+      unmatchedA: idsA.size - keys.length,
+      unmatchedB: idsB.size - keys.length
     };
   }
 
@@ -404,7 +500,14 @@
       return;
     }
 
-    const { comparisons, unmatchedA, unmatchedB } = buildComparisons(parsedA, parsedB);
+    const {
+      comparisons,
+      unmatchedA,
+      unmatchedB,
+      strategy,
+      sharedById,
+      sharedBySource
+    } = buildComparisons(parsedA, parsedB);
 
     const warnings = [];
     warnings.push(...parsedA.errors);
@@ -442,18 +545,24 @@
 
     if (comparisons.length === 0) {
       renderCurrent();
-      setStatus("No overlapping IDs found between files.", true);
+      setStatus("No overlapping match keys found between files.", true);
       if (warnings.length) {
         setError(warnings);
       }
       return;
     }
 
+    const unmatchedLabel = strategy === "source" ? "keys only" : "IDs only";
     const statusParts = [
       `Loaded ${comparisons.length} shared records`,
-      `${unmatchedA} IDs only in A`,
-      `${unmatchedB} IDs only in B`
+      `${unmatchedA} ${unmatchedLabel} in A`,
+      `${unmatchedB} ${unmatchedLabel} in B`
     ];
+    const matchLabel = strategy === "source" ? "source-path+index" : "id";
+    statusParts.push(`match: ${matchLabel}`);
+    if (sharedBySource > 0) {
+      statusParts.push(`shared by id/source: ${sharedById}/${sharedBySource}`);
+    }
 
     setStatus(statusParts.join(" • "), unmatchedA > 0 || unmatchedB > 0);
     setError(warnings);
