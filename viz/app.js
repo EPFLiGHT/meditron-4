@@ -81,6 +81,87 @@
     return null;
   }
 
+  function extractTextContent(value) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      const text = String(value);
+      return text.trim() ? text : null;
+    }
+    if (Array.isArray(value)) {
+      const parts = [];
+      for (const item of value) {
+        const text = extractTextContent(item);
+        if (text) {
+          parts.push(text);
+        }
+      }
+      if (parts.length > 0) {
+        return parts.join("\n");
+      }
+      return null;
+    }
+    if (typeof value === "object") {
+      // Handles chat formats like {type: "text", text: "..."} or generic nested content objects.
+      if (typeof value.text === "string" && value.text.trim()) {
+        return value.text;
+      }
+      if (typeof value.value === "string" && value.value.trim()) {
+        return value.value;
+      }
+      if (typeof value.content === "string" && value.content.trim()) {
+        return value.content;
+      }
+      if (Array.isArray(value.content)) {
+        return extractTextContent(value.content);
+      }
+    }
+    return null;
+  }
+
+  function extractFromChatTurns(row) {
+    const turns = Array.isArray(row.conversations)
+      ? row.conversations
+      : Array.isArray(row.messages)
+        ? row.messages
+        : null;
+
+    if (!turns) {
+      return null;
+    }
+
+    let question = null;
+    let answer = null;
+
+    for (const turn of turns) {
+      if (!turn || typeof turn !== "object") {
+        continue;
+      }
+
+      const roleRaw = turn.from ?? turn.role ?? turn.speaker ?? turn.author;
+      const role = typeof roleRaw === "string" ? roleRaw.toLowerCase() : "";
+      const text = extractTextContent(turn.value ?? turn.content ?? turn.text ?? turn.message);
+      if (!text) {
+        continue;
+      }
+
+      if (!question && (role === "user" || role === "human")) {
+        question = text;
+      }
+      if (role === "assistant" || role === "model" || role === "gpt") {
+        // Use the latest assistant response if multiple exist.
+        answer = text;
+      }
+    }
+
+    if (!question || !answer) {
+      return null;
+    }
+
+    return { question, answer };
+  }
+
   async function parseJsonlFile(file, sideLabel) {
     const text = await file.text();
     const lines = text.split(/\r?\n/);
@@ -116,13 +197,17 @@
       }
 
       const questionHit = pickFirstValue(row, QUESTION_KEYS);
-      if (!questionHit) {
+      const answerHit = pickFirstValue(row, ANSWER_KEYS);
+      const chatExtract = (!questionHit || !answerHit) ? extractFromChatTurns(row) : null;
+
+      const question = questionHit ? questionHit.value : chatExtract ? chatExtract.question : null;
+      const answer = answerHit ? answerHit.value : chatExtract ? chatExtract.answer : null;
+
+      if (!question) {
         missingQuestionCount += 1;
         continue;
       }
-
-      const answerHit = pickFirstValue(row, ANSWER_KEYS);
-      if (!answerHit) {
+      if (!answer) {
         missingAnswerCount += 1;
         continue;
       }
@@ -135,8 +220,8 @@
 
       recordsById.set(id, {
         id,
-        question: questionHit.value,
-        answer: answerHit.value,
+        question,
+        answer,
         sourceLine: i + 1
       });
     }
