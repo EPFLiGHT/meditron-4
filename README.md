@@ -56,6 +56,16 @@ bash distillation/distill_head.sh distillation/datasets_to_distill.txt \
   --model-revision "$DISTILL_MODEL_REVISION"
 ```
 
+To prequeue workers immediately (as dependencies on the head job):
+
+```bash
+bash distillation/submit_distill.sh distillation/datasets_to_distill.txt \
+  --strict-repro \
+  --deterministic \
+  --seed 42 \
+  --model-revision "$DISTILL_MODEL_REVISION"
+```
+
 Outputs and logs:
 - Run state: `distill_reports/pool-<model>-<timestamp>-<rid>/` (`queue.db`, summary, events)
 - Distilled shards: alongside each source dataset as `*_distillation_<model>.shard-*.jsonl`

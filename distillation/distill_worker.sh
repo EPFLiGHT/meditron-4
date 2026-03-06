@@ -8,7 +8,6 @@
 #SBATCH --cpus-per-task 64
 #SBATCH --partition=normal
 #SBATCH --time=5:59:59
-#SBATCH --environment ../../.edf/inference.toml
 #SBATCH -A a127
 
 ulimit -c 0
@@ -114,8 +113,7 @@ wait_for_vllm_ready() {
 import json
 import sys
 import time
-import requests
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import urllib.request
 
 base_url = sys.argv[1].rstrip('/')
 wait_seconds = int(sys.argv[2])
@@ -143,6 +141,42 @@ log_event() {
   local msg_clean
   msg_clean="$(echo "$message" | tr '\n\t' '  ')"
   printf "%s\t%s\t%s\t%s\t%s\n" "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "$WORKER_ID" "$shard_id" "$transition" "$msg_clean" >> "$RUN_DIR/events.log"
+}
+
+wait_for_queue_ready() {
+  local max_wait="${1:-600}"
+  local start_ts now_ts elapsed
+  start_ts="$(date +%s)"
+  while true; do
+    if [ -f "$RUN_DIR/queue.db" ] && python3 - "$RUN_DIR/queue.db" <<'PY'
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+conn = sqlite3.connect(db_path)
+try:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shards'"
+    ).fetchone()
+    if row and int(row[0]) == 1:
+        sys.exit(0)
+except Exception:
+    pass
+finally:
+    conn.close()
+sys.exit(1)
+PY
+    then
+      return 0
+    fi
+    now_ts="$(date +%s)"
+    elapsed=$((now_ts - start_ts))
+    if [ "$elapsed" -ge "$max_wait" ]; then
+      echo "Timed out waiting for queue.db/shards table in $RUN_DIR after ${max_wait}s"
+      return 1
+    fi
+    sleep 2
+  done
 }
 
 start_vllm() {
@@ -444,6 +478,8 @@ import datetime as dt
 import hashlib
 import json
 import os
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
@@ -596,22 +632,36 @@ def render_chat_prompt(tokenizer, messages):
     )
 
 
-def _post_completion_request(session, base_url, payload, timeout_seconds, retries, retry_base_seconds):
+def _post_completion_request(base_url, payload, timeout_seconds, retries, retry_base_seconds):
     url = f"{base_url.rstrip('/')}/completions"
+    body = json.dumps(payload).encode("utf-8")
+    last_error = None
+    attempts = max(1, int(retries))
 
-    @retry(
-        stop=stop_after_attempt(retries),
-        wait=wait_exponential(multiplier=retry_base_seconds, min=retry_base_seconds),
-        retry=retry_if_exception_type(Exception),
-        reraise=True,
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+                status = getattr(response, "status", None)
+                text = response.read().decode("utf-8")
+            if status is not None and status >= 400:
+                raise RuntimeError(f"Completion HTTP {status}: {text[:500]}")
+            return json.loads(text) if text else {}
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt >= attempts:
+                break
+            sleep_seconds = float(retry_base_seconds) * (2 ** (attempt - 1))
+            time.sleep(sleep_seconds)
+
+    raise RuntimeError(
+        f"Completion request failed after {attempts} attempts: {last_error}"
     )
-    def _do_request():
-        response = session.post(url, json=payload, timeout=timeout_seconds)
-        if not response.ok:
-            raise RuntimeError(f"Completion HTTP {response.status_code}: {response.text[:500]}")
-        return response.json()
-
-    return _do_request()
 
 
 def parse_completion_payload(payload: Any):
@@ -641,10 +691,9 @@ async def request_completion(base_url, timeout_seconds, model, prompt, temperatu
     if top_p is not None:
         payload["top_p"] = float(top_p)
     loop = asyncio.get_event_loop()
-    session = requests.Session()
     response_payload = await loop.run_in_executor(
         None,
-        lambda: _post_completion_request(session, base_url, payload, timeout_seconds, retries, retry_base_seconds),
+        lambda: _post_completion_request(base_url, payload, timeout_seconds, retries, retry_base_seconds),
     )
     return parse_completion_payload(response_payload)
 
@@ -678,18 +727,27 @@ async def generate_with_retry(
 
 
 def load_existing_keys(output_path):
-    from datasets import load_dataset
-
     if not output_path.exists():
         return set()
 
-    existing = load_dataset("json", data_files=str(output_path), split="train")
-    return set(completion_key(row) for row in existing)
+    keys = set()
+    with output_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                keys.add(completion_key(row))
+    return keys
 
 
 def main():
     args = parse_args()
-    from datasets import concatenate_datasets, load_dataset, load_from_disk
+    from datasets import load_dataset, load_from_disk
 
     if args.strict_repro and args.seed is None:
         print("--seed is required when --strict-repro is enabled")
@@ -806,27 +864,52 @@ def main():
         load_from_cache_file=False,
     )
 
+    # Merge previous shard output and newly processed rows with schema-tolerant
+    # dict handling so mixed numeric/null dtypes in source columns do not fail.
+    existing_rows = []
     if output_path.exists():
-        existing_dataset = load_dataset("json", data_files=str(output_path), split="train")
-        combined = concatenate_datasets([existing_dataset, enriched_pending])
-    else:
-        combined = enriched_pending
+        with output_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    existing_rows.append(row)
+    new_rows = [dict(row) for row in enriched_pending]
 
-    combined = combined.sort("distilled_source_index")
-    seen_keys = set()
-    combined = combined.filter(
-        lambda row: completion_key(row) not in seen_keys and not seen_keys.add(completion_key(row)),
-        desc=f"Deduplicating shard output for {dataset_path.name} shard {args.shard_index}",
+    merged = {}
+    for row in existing_rows:
+        merged[completion_key(row)] = row
+    for row in new_rows:
+        merged[completion_key(row)] = row
+
+    def _source_index(row):
+        value = row.get("distilled_source_index")
+        try:
+            return int(value)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    combined_rows = sorted(merged.values(), key=_source_index)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for row in combined_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    error_count = sum(
+        1
+        for row in combined_rows
+        if isinstance(row.get("distilled_error"), str) and row.get("distilled_error").strip()
     )
-    combined.to_json(str(output_path))
-
-    error_count = 0
-    if "distilled_error" in combined.column_names:
-        error_count = sum(1 for value in combined["distilled_error"] if isinstance(value, str) and value.strip())
+    written_count = len(combined_rows)
+    newly_processed_count = len(new_rows)
 
     print(
         f"Done {dataset_path.name} shard {args.shard_index}/{args.num_shards}: "
-        f"written={len(combined)} newly_processed={len(enriched_pending)} failed={error_count}",
+        f"written={written_count} newly_processed={newly_processed_count} failed={error_count}",
         flush=True,
     )
 
@@ -836,8 +919,8 @@ def main():
             "output_path": str(output_path),
             "dataset_path": str(dataset_path),
             "dataset_cache_path": str(cache_path),
-            "num_rows": len(combined),
-            "num_newly_processed": len(enriched_pending),
+            "num_rows": written_count,
+            "num_newly_processed": newly_processed_count,
             "num_errors": error_count,
             "repro_config_sha256": repro_hash,
             "repro_config": repro,
@@ -856,8 +939,13 @@ PY
 
 parse_args "$@"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "${SLURM_SUBMIT_DIR}/distillation/distill_worker.sh" ]; then
+  PROJECT_ROOT="$(cd "${SLURM_SUBMIT_DIR}" && pwd)"
+  SCRIPT_DIR="$PROJECT_ROOT/distillation"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 cd "$PROJECT_ROOT" || exit 1
 
 if [ -f .env ]; then
@@ -876,6 +964,8 @@ if [ ! -d "$RUN_DIR" ]; then
   echo "Run dir not found: $RUN_DIR"
   exit 1
 fi
+
+wait_for_queue_ready 600
 
 WORKER_ID="${SLURM_JOB_ID:-noslurm}:$(hostname):$$"
 log_event "-" "worker_start" "request_concurrency=$REQUEST_CONCURRENCY"

@@ -133,6 +133,25 @@ if [ ! -e "$MODEL_PATH" ] && [ -n "$STORAGE_ROOT" ] && [ -e "$STORAGE_ROOT$MODEL
     echo "Resolved MODEL_PATH to: $MODEL_PATH"
 fi
 
+if [ -d "$MODEL_PATH" ]; then
+    if [ ! -f "$MODEL_PATH/config.json" ]; then
+        echo "MODEL_PATH is missing config.json: $MODEL_PATH"
+        exit 1
+    fi
+    if [ ! -f "$MODEL_PATH/tokenizer_config.json" ] && [ ! -f "$MODEL_PATH/tokenizer.json" ]; then
+        echo "MODEL_PATH is missing tokenizer files: $MODEL_PATH"
+        exit 1
+    fi
+    if ! compgen -G "$MODEL_PATH/model-*.safetensors" > /dev/null \
+       && [ ! -f "$MODEL_PATH/model.safetensors" ] \
+       && [ ! -f "$MODEL_PATH/pytorch_model.bin" ] \
+       && ! compgen -G "$MODEL_PATH/checkpoint-*/model-*.safetensors" > /dev/null \
+       && ! compgen -G "$MODEL_PATH/checkpoint-*/pytorch_model*.bin" > /dev/null; then
+        echo "MODEL_PATH has no model weights yet: $MODEL_PATH"
+        exit 1
+    fi
+fi
+
 # 1. Project root & env
 export PROJECT_ROOT=${SLURM_SUBMIT_DIR:-$(pwd)}
 cd "$PROJECT_ROOT"
@@ -201,7 +220,17 @@ if [ "$DEBUG_FLAG" -eq 1 ]; then
 fi
 
 #MODEL_ARGS="pretrained=$MODEL_PATH,dtype=bfloat16,attn_implementation=flash_attention_3,trust_remote_code=True"
-MODEL_ARGS="pretrained=$MODEL_PATH,dtype=bfloat16,attn_implementation=flash_attention_2,trust_remote_code=True"
+TOKENIZER_ARGS=""
+if [ -f "$MODEL_PATH/config.json" ] && rg -q '"model_type"\s*:\s*"apertus"' "$MODEL_PATH/config.json"; then
+    APERTUS_TOKENIZER_PATH="${APERTUS_TOKENIZER_PATH:-$STORAGE_ROOT/apertus/huggingface/swiss-ai/Apertus-8B-Instruct-2509}"
+    if [ -d "$APERTUS_TOKENIZER_PATH" ]; then
+        TOKENIZER_ARGS=",tokenizer=$APERTUS_TOKENIZER_PATH"
+        echo "Using Apertus tokenizer fallback: $APERTUS_TOKENIZER_PATH"
+    else
+        echo "Apertus model detected but fallback tokenizer path not found: $APERTUS_TOKENIZER_PATH"
+    fi
+fi
+MODEL_ARGS="pretrained=$MODEL_PATH,dtype=bfloat16,attn_implementation=flash_attention_2,trust_remote_code=True$TOKENIZER_ARGS"
 
 TASKS="multimedqa"
 

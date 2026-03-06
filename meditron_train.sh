@@ -60,9 +60,9 @@ if [ -z "$SLURM_JOB_ID" ]; then
     EVAL_JOB_ID="$(echo "$EVAL_SUBMIT_OUT" | awk '{print $4}')"
     echo "🧪 Submitted eval job (afterok:$JOB_ID): $EVAL_JOB_ID"
 
-    EVAL_SUBMIT_OUT_NO_COT="$(sbatch --dependency=afterok:"$JOB_ID" -J "${JOB_NAME}-eval" "$EVAL_SCRIPT_NO_COT" "$MODEL_PATH")"
-    EVAL_JOB_ID="$(echo "$EVAL_SUBMIT_OUT" | awk '{print $4}')"
-    echo "🧪 Submitted eval no cot job (afterok:$JOB_ID): $EVAL_JOB_ID"
+    EVAL_SUBMIT_OUT_NO_COT="$(sbatch --dependency=afterok:"$JOB_ID" -J "${JOB_NAME}-eval-no-cot" "$EVAL_SCRIPT_NO_COT" "$MODEL_PATH")"
+    EVAL_NO_COT_JOB_ID="$(echo "$EVAL_SUBMIT_OUT_NO_COT" | awk '{print $4}')"
+    echo "🧪 Submitted eval no cot job (afterok:$JOB_ID): $EVAL_NO_COT_JOB_ID"
 
     LOGITS_SUBMIT_OUT="$(sbatch --dependency=afterok:"$JOB_ID" -J "${JOB_NAME}-logits" "$LOGITS_SCRIPT" "$MODEL_PATH")"
     LOGITS_JOB_ID="$(echo "$LOGITS_SUBMIT_OUT" | awk '{print $4}')"
@@ -197,6 +197,7 @@ srun \
     -A a127 \
     --reservation=sai-a127 \
     bash -c "$FULL_CMD"
+TRAIN_RC=$?
 
 if [ -n "$MONITOR_PID" ]; then
     kill "$MONITOR_PID" 2>/dev/null || true
@@ -204,3 +205,8 @@ if [ -n "$MONITOR_PID" ]; then
 fi
 
 echo "END TIME: $(date)"
+
+if [ "${TRAIN_RC:-1}" -ne 0 ]; then
+    echo "❌ Training failed with exit code: $TRAIN_RC"
+    exit "$TRAIN_RC"
+fi

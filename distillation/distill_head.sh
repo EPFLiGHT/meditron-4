@@ -7,8 +7,9 @@
 #SBATCH --cpus-per-task 2
 #SBATCH --partition=normal
 #SBATCH --time=12:00:00
-#SBATCH --environment ../../.edf/inference.toml
 #SBATCH -A a127
+
+set -eo pipefail
 
 DEFAULT_LIST_FILE="datasets_to_distill.txt"
 DEFAULT_MODEL_NAME="google/medgemma-27b-text-it"
@@ -18,11 +19,12 @@ DEFAULT_MAX_RETRIES_PER_SHARD=2
 DEFAULT_LEASE_TIMEOUT_SECONDS=7200
 DEFAULT_WORKER_TIME_LIMIT="05:59:59"
 DEFAULT_MONITOR_INTERVAL_SECONDS=30
+DEFAULT_SBATCH_ENV_FILE="${HOME}/.edf/inference.toml"
 
 usage() {
   cat <<EOF2
 Usage:
-  bash $0 [list_file] [--model <name>] [--num-workers N] [--request-concurrency N] [--limit N] [--seed N] [--deterministic] [--strict-repro] [--model-revision REV] [--max-retries-per-shard N] [--lease-timeout-seconds N] [--worker-time-limit HH:MM:SS] [--monitor-interval-seconds N]
+  bash $0 [list_file] [--model <name>] [--num-workers N] [--request-concurrency N] [--limit N] [--seed N] [--deterministic] [--strict-repro] [--model-revision REV] [--max-retries-per-shard N] [--lease-timeout-seconds N] [--worker-time-limit HH:MM:SS] [--monitor-interval-seconds N] [--sbatch-environment <path>]
 EOF2
 }
 
@@ -40,6 +42,7 @@ parse_args() {
   LEASE_TIMEOUT_SECONDS="$DEFAULT_LEASE_TIMEOUT_SECONDS"
   WORKER_TIME_LIMIT="$DEFAULT_WORKER_TIME_LIMIT"
   MONITOR_INTERVAL_SECONDS="$DEFAULT_MONITOR_INTERVAL_SECONDS"
+  SBATCH_ENV_FILE="${DISTILL_SBATCH_ENV_FILE:-$DEFAULT_SBATCH_ENV_FILE}"
 
   if [ -n "${1:-}" ] && [[ "$1" != --* ]]; then
     LIST_FILE="$1"
@@ -93,6 +96,10 @@ parse_args() {
       --monitor-interval-seconds)
         shift
         MONITOR_INTERVAL_SECONDS="${1:-}"
+        ;;
+      --sbatch-environment)
+        shift
+        SBATCH_ENV_FILE="${1:-}"
         ;;
       -h|--help)
         usage
@@ -151,9 +158,16 @@ submit_worker() {
   if [ -n "$LIMIT_ARG" ]; then
     SBATCH_CMD+=(--limit "$LIMIT_ARG")
   fi
+  if [ -n "${SBATCH_ENV_FILE:-}" ] && [ -f "${SBATCH_ENV_FILE:-}" ]; then
+    SBATCH_CMD+=(--environment "$SBATCH_ENV_FILE")
+  fi
 
   local out
-  out="$(${SBATCH_CMD[@]})"
+  if ! out="$("${SBATCH_CMD[@]}" 2>&1)"; then
+    echo "[ERROR] Failed to submit worker slot=$slot"
+    echo "$out"
+    return 1
+  fi
   echo "$out"
   local jid
   jid="$(echo "$out" | awk '{print $4}')"
@@ -162,6 +176,7 @@ submit_worker() {
     WORKERS_STARTED=$((WORKERS_STARTED + 1))
     log_event "-" "worker_submitted" "slot=$slot job_id=$jid"
   fi
+  return 0
 }
 
 active_worker_count() {
@@ -174,10 +189,64 @@ active_worker_count() {
   squeue -h -j "$csv" | wc -l | tr -d ' '
 }
 
+known_worker_job_ids() {
+  {
+    if [ "${#WORKER_JOB_IDS[@]}" -gt 0 ]; then
+      printf "%s\n" "${WORKER_JOB_IDS[@]}"
+    fi
+    if [ -n "${RUN_DIR:-}" ] && [ -f "$RUN_DIR/prequeued_worker_ids.txt" ]; then
+      sed -e 's/[[:space:]]//g' "$RUN_DIR/prequeued_worker_ids.txt"
+    fi
+  } | awk 'NF' | sort -u
+}
+
+cancel_workers_on_head_failure() {
+  local rc="$1"
+  if [ "$rc" -eq 0 ]; then
+    return 0
+  fi
+  if ! command -v scancel >/dev/null 2>&1; then
+    echo "[WARN] Head failed (rc=$rc) but scancel is not available; unable to cancel workers."
+    return 0
+  fi
+
+  local workers_csv
+  workers_csv="$(known_worker_job_ids | paste -sd, -)"
+  if [ -z "$workers_csv" ]; then
+    return 0
+  fi
+
+  echo "[HEAD] Head failed (rc=$rc). Cancelling worker jobs: $workers_csv"
+  scancel "$workers_csv" >/dev/null 2>&1 || true
+  if [ -n "${RUN_DIR:-}" ] && [ -f "$RUN_DIR/events.log" ] && [ -n "${HEAD_ID:-}" ]; then
+    log_event "-" "workers_cancelled" "reason=head_failure rc=$rc jobs=$workers_csv"
+  fi
+}
+
+require_python_module() {
+  local module="$1"
+  if ! python3 - "$module" <<'PY'
+import importlib
+import sys
+module = sys.argv[1]
+importlib.import_module(module)
+PY
+  then
+    echo "[ERROR] Missing Python module: $module"
+    echo "Run in your inference environment or install it (e.g., pip install ${module})."
+    return 1
+  fi
+}
+
 parse_args "$@"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "${SLURM_SUBMIT_DIR}/distillation/distill_head.sh" ]; then
+  PROJECT_ROOT="$(cd "${SLURM_SUBMIT_DIR}" && pwd)"
+  SCRIPT_DIR="$PROJECT_ROOT/distillation"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 cd "$PROJECT_ROOT" || exit 1
 
 if [ -f .env ]; then
@@ -195,6 +264,22 @@ if [ ! -f "$LIST_FILE" ]; then
   exit 1
 fi
 
+if ! command -v sbatch >/dev/null 2>&1; then
+  echo "[ERROR] sbatch is not available in PATH."
+  exit 1
+fi
+
+if ! command -v squeue >/dev/null 2>&1; then
+  echo "[ERROR] squeue is not available in PATH."
+  exit 1
+fi
+
+if [ -n "${SBATCH_ENV_FILE:-}" ] && [ ! -f "${SBATCH_ENV_FILE:-}" ]; then
+  echo "[WARN] SBATCH environment file not found: ${SBATCH_ENV_FILE}. Submissions will proceed without --environment."
+fi
+
+require_python_module datasets
+
 if [ -f "$PROJECT_ROOT/scripts/slack_helpers.sh" ]; then
   source "$PROJECT_ROOT/scripts/slack_helpers.sh"
 fi
@@ -204,7 +289,16 @@ START_HUMAN="$(date -Is)"
 RUN_NAME="distill-pool-${MODEL_NAME}"
 SLACK_REPORTS_DIR="$PROJECT_ROOT/distill_reports"
 SLACK_PHASE="distill"
-trap 'rc=$?; if declare -F slack_notify >/dev/null 2>&1; then slack_notify "$rc" "$SLACK_PHASE"; fi; exit "$rc"' EXIT
+on_head_exit() {
+  local rc=$?
+  set +e
+  cancel_workers_on_head_failure "$rc"
+  if declare -F slack_notify >/dev/null 2>&1; then
+    slack_notify "$rc" "$SLACK_PHASE"
+  fi
+  exit "$rc"
+}
+trap on_head_exit EXIT
 
 JOB_PREFIX="$(python3 - "$MODEL_NAME" <<'PY'
 import sys
@@ -218,6 +312,8 @@ print(f"distill-{model_tag(sys.argv[1])}-")
 PY
 )"
 
+RUN_DIR="${DISTILL_RUN_DIR:-}"
+if [ -z "$RUN_DIR" ]; then
 RUN_DIR="$(python3 - "$PROJECT_ROOT" "$MODEL_NAME" <<'PY'
 import datetime as dt
 import secrets
@@ -235,6 +331,13 @@ stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 rid = secrets.token_hex(4)
 run = root / "distill_reports" / f"pool-{model_tag(model)}-{stamp}-{rid}"
 print(run)
+PY
+)"
+fi
+RUN_DIR="$(python3 - "$RUN_DIR" <<'PY'
+import sys
+from pathlib import Path
+print(Path(sys.argv[1]).expanduser().resolve())
 PY
 )"
 mkdir -p "$RUN_DIR"
@@ -385,9 +488,34 @@ PY
 
 WORKER_JOB_IDS=()
 WORKERS_STARTED=0
-for slot in $(seq 1 "$NUM_WORKERS"); do
-  submit_worker "$slot"
-done
+if [ "${DISTILL_PREQUEUED_WORKERS:-0}" = "1" ]; then
+  PREQUEUED_FILE="$RUN_DIR/prequeued_worker_ids.txt"
+  if [ ! -s "$PREQUEUED_FILE" ]; then
+    for _ in $(seq 1 30); do
+      [ -s "$PREQUEUED_FILE" ] && break
+      sleep 2
+    done
+  fi
+  if [ -s "$PREQUEUED_FILE" ]; then
+    while IFS= read -r jid; do
+      jid="$(echo "$jid" | tr -d '[:space:]')"
+      [ -z "$jid" ] && continue
+      WORKER_JOB_IDS+=("$jid")
+      WORKERS_STARTED=$((WORKERS_STARTED + 1))
+      log_event "-" "worker_registered" "prequeued_job_id=$jid"
+    done < "$PREQUEUED_FILE"
+    echo "[HEAD] Registered ${#WORKER_JOB_IDS[@]} prequeued worker jobs."
+  else
+    echo "[WARN] DISTILL_PREQUEUED_WORKERS=1 but no prequeued worker ids file found at $PREQUEUED_FILE; submitting workers from head."
+    for slot in $(seq 1 "$NUM_WORKERS"); do
+      submit_worker "$slot"
+    done
+  fi
+else
+  for slot in $(seq 1 "$NUM_WORKERS"); do
+    submit_worker "$slot"
+  done
+fi
 
 while true; do
   WORKERS_ALIVE="$(active_worker_count)"
@@ -447,7 +575,7 @@ if __name__ == "__main__":
         conn.close()
 PY
 
-  read -r TOTAL PENDING LEASED DONE FAILED <<<"$(python3 - "$RUN_DIR" <<'PY'
+  SUMMARY_FIELDS="$(python3 - "$RUN_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -455,6 +583,7 @@ summary = json.loads((Path(sys.argv[1]).resolve() / "summary.json").read_text(en
 print(summary["total"], summary["pending"], summary["leased"], summary["done"], summary["failed"])
 PY
 )"
+  read -r TOTAL PENDING LEASED DONE FAILED <<<"$SUMMARY_FIELDS"
 
   echo "[HEAD] total=$TOTAL pending=$PENDING leased=$LEASED done=$DONE failed=$FAILED workers_alive=$WORKERS_ALIVE workers_started=$WORKERS_STARTED"
 
@@ -491,7 +620,7 @@ finally:
 print(f"[HEAD] Run dir: {run_dir}")
 print(f"[HEAD] Failed shards: {len(rows)}")
 for shard_id, attempt, last_error in rows:
-    print(f\"[HEAD][FAILED] {shard_id} attempts={attempt} error={last_error}\")
+    print(f"[HEAD][FAILED] {shard_id} attempts={attempt} error={last_error}")
 PY
 
 FAILED_COUNT="$(python3 - "$RUN_DIR" <<'PY'
