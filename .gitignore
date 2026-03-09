@@ -16,3 +16,4 @@ distill_reports
 __pycache__
 distillation/distilled_outputs
 distillation/distill_reports
+*.jsonl

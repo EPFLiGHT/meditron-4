@@ -54,7 +54,7 @@ if [ -z "$SLURM_JOB_ID" ]; then
 
     EVAL_SCRIPT="$PROJECT_ROOT/meditron_eval.sh"
     EVAL_SCRIPT_NO_COT="$PROJECT_ROOT/meditron_eval_no_cot.sh"
-    LOGITS_SCRIPT="$PROJECT_ROOT/meditron_eval_logits.sh"
+    # LOGITS_SCRIPT="$PROJECT_ROOT/meditron_eval_logits.sh"
 
     EVAL_SUBMIT_OUT="$(sbatch --dependency=afterok:"$JOB_ID" -J "${JOB_NAME}-eval" "$EVAL_SCRIPT" "$MODEL_PATH")"
     EVAL_JOB_ID="$(echo "$EVAL_SUBMIT_OUT" | awk '{print $4}')"
@@ -64,9 +64,9 @@ if [ -z "$SLURM_JOB_ID" ]; then
     EVAL_NO_COT_JOB_ID="$(echo "$EVAL_SUBMIT_OUT_NO_COT" | awk '{print $4}')"
     echo "🧪 Submitted eval no cot job (afterok:$JOB_ID): $EVAL_NO_COT_JOB_ID"
 
-    LOGITS_SUBMIT_OUT="$(sbatch --dependency=afterok:"$JOB_ID" -J "${JOB_NAME}-logits" "$LOGITS_SCRIPT" "$MODEL_PATH")"
-    LOGITS_JOB_ID="$(echo "$LOGITS_SUBMIT_OUT" | awk '{print $4}')"
-    echo "📊 Submitted logits eval job (afterok:$JOB_ID): $LOGITS_JOB_ID"
+    # LOGITS_SUBMIT_OUT="$(sbatch --dependency=afterok:"$JOB_ID" -J "${JOB_NAME}-logits" "$LOGITS_SCRIPT" "$MODEL_PATH")"
+    # LOGITS_JOB_ID="$(echo "$LOGITS_SUBMIT_OUT" | awk '{print $4}')"
+    # echo "📊 Submitted logits eval job (afterok:$JOB_ID): $LOGITS_JOB_ID"
 
     LOG_FILE="$PROJECT_ROOT/train_reports/R-${JOB_NAME}.${JOB_ID}.err"
     while [ ! -f "$LOG_FILE" ]; do sleep 1; done

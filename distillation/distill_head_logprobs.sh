@@ -11,10 +11,10 @@
 
 set -eo pipefail
 
-DEFAULT_LIST_FILE="datasets_to_distill.txt"
 DEFAULT_MODEL_NAME="google/medgemma-27b-text-it"
 DEFAULT_REQUEST_CONCURRENCY=8
 DEFAULT_NUM_WORKERS=4
+DEFAULT_NUM_SHARDS=4
 DEFAULT_MAX_RETRIES_PER_SHARD=2
 DEFAULT_LEASE_TIMEOUT_SECONDS=7200
 DEFAULT_WORKER_TIME_LIMIT="05:59:59"
@@ -24,28 +24,27 @@ DEFAULT_SBATCH_ENV_FILE="${HOME}/.edf/inference.toml"
 usage() {
   cat <<EOF2
 Usage:
-  bash $0 [list_file] [--model <name>] [--num-workers N] [--request-concurrency N] [--limit N] [--seed N] [--deterministic] [--strict-repro] [--model-revision REV] [--max-retries-per-shard N] [--lease-timeout-seconds N] [--worker-time-limit HH:MM:SS] [--monitor-interval-seconds N] [--sbatch-environment <path>]
+  bash $0 <input_jsonl> [--model <name>] [--num-workers N] [--num-shards N] [--request-concurrency N] [--limit N] [--max-retries-per-shard N] [--lease-timeout-seconds N] [--worker-time-limit HH:MM:SS] [--monitor-interval-seconds N] [--sbatch-environment <path>] [--top-logprobs K] [--no-auto-tail]
 EOF2
 }
 
 parse_args() {
-  LIST_FILE="$DEFAULT_LIST_FILE"
+  DATASET_PATH=""
   MODEL_NAME="$DEFAULT_MODEL_NAME"
   NUM_WORKERS="$DEFAULT_NUM_WORKERS"
+  NUM_SHARDS="$DEFAULT_NUM_SHARDS"
   REQUEST_CONCURRENCY="$DEFAULT_REQUEST_CONCURRENCY"
   LIMIT_ARG=""
-  SEED_ARG=""
-  DETERMINISTIC=0
-  STRICT_REPRO=0
-  MODEL_REVISION_ARG=""
   MAX_RETRIES_PER_SHARD="$DEFAULT_MAX_RETRIES_PER_SHARD"
   LEASE_TIMEOUT_SECONDS="$DEFAULT_LEASE_TIMEOUT_SECONDS"
   WORKER_TIME_LIMIT="$DEFAULT_WORKER_TIME_LIMIT"
   MONITOR_INTERVAL_SECONDS="$DEFAULT_MONITOR_INTERVAL_SECONDS"
   SBATCH_ENV_FILE="${DISTILL_SBATCH_ENV_FILE:-$DEFAULT_SBATCH_ENV_FILE}"
+  TOP_LOGPROBS=4
+  AUTO_TAIL_EVENTS=1
 
   if [ -n "${1:-}" ] && [[ "$1" != --* ]]; then
-    LIST_FILE="$1"
+    DATASET_PATH="$1"
     shift
   fi
 
@@ -63,23 +62,13 @@ parse_args() {
         shift
         REQUEST_CONCURRENCY="${1:-}"
         ;;
+      --num-shards)
+        shift
+        NUM_SHARDS="${1:-}"
+        ;;
       --limit)
         shift
         LIMIT_ARG="${1:-}"
-        ;;
-      --seed)
-        shift
-        SEED_ARG="${1:-}"
-        ;;
-      --deterministic)
-        DETERMINISTIC=1
-        ;;
-      --strict-repro)
-        STRICT_REPRO=1
-        ;;
-      --model-revision)
-        shift
-        MODEL_REVISION_ARG="${1:-}"
         ;;
       --max-retries-per-shard)
         shift
@@ -101,6 +90,13 @@ parse_args() {
         shift
         SBATCH_ENV_FILE="${1:-}"
         ;;
+      --top-logprobs)
+        shift
+        TOP_LOGPROBS="${1:-}"
+        ;;
+      --no-auto-tail)
+        AUTO_TAIL_EVENTS=0
+        ;;
       -h|--help)
         usage
         exit 0
@@ -114,8 +110,8 @@ parse_args() {
     shift
   done
 
-  if [ "$STRICT_REPRO" -eq 1 ] && [ -z "$SEED_ARG" ]; then
-    echo "--seed is required with --strict-repro"
+  if [ -z "$DATASET_PATH" ]; then
+    usage
     exit 1
   fi
 }
@@ -127,6 +123,19 @@ log_event() {
   local msg_clean
   msg_clean="$(echo "$message" | tr '\n\t' '  ')"
   printf "%s\t%s\t%s\t%s\t%s\n" "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "$HEAD_ID" "$shard_id" "$transition" "$msg_clean" >> "$RUN_DIR/events.log"
+}
+
+start_event_tail() {
+  if [ "${AUTO_TAIL_EVENTS:-1}" -ne 1 ]; then
+    return 0
+  fi
+  if ! command -v tail >/dev/null 2>&1; then
+    return 0
+  fi
+  (
+    tail -n 0 -F "$RUN_DIR/events.log" 2>/dev/null | sed -u 's/^/[EVENT] /'
+  ) &
+  EVENT_TAIL_PID=$!
 }
 
 submit_worker() {
@@ -141,25 +150,14 @@ submit_worker() {
     SBATCH_CMD+=(--environment "$SBATCH_ENV_FILE")
   fi
   SBATCH_CMD+=(
-    "$SCRIPT_DIR/distill_worker.sh"
+    "$SCRIPT_DIR/distill_worker_logprobs.sh"
     --run-dir "$RUN_DIR"
     --model "$MODEL_NAME"
     --request-concurrency "$REQUEST_CONCURRENCY"
     --lease-timeout-seconds "$LEASE_TIMEOUT_SECONDS"
     --max-retries-per-shard "$MAX_RETRIES_PER_SHARD"
+    --top-logprobs "$TOP_LOGPROBS"
   )
-  if [ -n "$SEED_ARG" ]; then
-    SBATCH_CMD+=(--seed "$SEED_ARG")
-  fi
-  if [ "$DETERMINISTIC" -eq 1 ]; then
-    SBATCH_CMD+=(--deterministic)
-  fi
-  if [ "$STRICT_REPRO" -eq 1 ]; then
-    SBATCH_CMD+=(--strict-repro)
-  fi
-  if [ -n "$MODEL_REVISION_ARG" ]; then
-    SBATCH_CMD+=(--model-revision "$MODEL_REVISION_ARG")
-  fi
   if [ -n "$LIMIT_ARG" ]; then
     SBATCH_CMD+=(--limit "$LIMIT_ARG")
   fi
@@ -171,11 +169,17 @@ submit_worker() {
   fi
   echo "$out"
   local jid
-  jid="$(echo "$out" | awk '{print $4}')"
+  jid="$(echo "$out" | awk '/Submitted batch job/{print $NF}' | tail -n1)"
+  if [ -z "$jid" ]; then
+    jid="$(echo "$out" | awk '/^[0-9]+([;].*)?$/{print $1}' | tail -n1 | cut -d';' -f1)"
+  fi
   if [ -n "$jid" ]; then
     WORKER_JOB_IDS+=("$jid")
     WORKERS_STARTED=$((WORKERS_STARTED + 1))
     log_event "-" "worker_submitted" "slot=$slot job_id=$jid"
+  else
+    echo "[ERROR] Unable to parse worker job id from sbatch output (slot=$slot)"
+    return 1
   fi
   return 0
 }
@@ -241,7 +245,7 @@ PY
 
 parse_args "$@"
 
-if [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "${SLURM_SUBMIT_DIR}/distillation/distill_head.sh" ]; then
+if [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "${SLURM_SUBMIT_DIR}/distillation/distill_head_logprobs.sh" ]; then
   PROJECT_ROOT="$(cd "${SLURM_SUBMIT_DIR}" && pwd)"
   SCRIPT_DIR="$PROJECT_ROOT/distillation"
 else
@@ -256,12 +260,14 @@ if [ -f .env ]; then
   set +o allexport
 fi
 
-if [ "$LIST_FILE" = "$DEFAULT_LIST_FILE" ]; then
-  LIST_FILE="$SCRIPT_DIR/$DEFAULT_LIST_FILE"
-fi
-
-if [ ! -f "$LIST_FILE" ]; then
-  echo "List file not found: $LIST_FILE"
+DATASET_PATH="$(python3 - "$DATASET_PATH" <<'PY'
+import sys
+from pathlib import Path
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+if [ ! -f "$DATASET_PATH" ]; then
+  echo "Input JSONL not found: $DATASET_PATH"
   exit 1
 fi
 
@@ -293,6 +299,10 @@ SLACK_PHASE="distill"
 on_head_exit() {
   local rc=$?
   set +e
+  if [ -n "${EVENT_TAIL_PID:-}" ] && kill -0 "$EVENT_TAIL_PID" 2>/dev/null; then
+    kill "$EVENT_TAIL_PID" 2>/dev/null || true
+    wait "$EVENT_TAIL_PID" 2>/dev/null || true
+  fi
   cancel_workers_on_head_failure "$rc"
   if declare -F slack_notify >/dev/null 2>&1; then
     slack_notify "$rc" "$SLACK_PHASE"
@@ -345,102 +355,64 @@ mkdir -p "$RUN_DIR"
 HEAD_ID="head:${SLURM_JOB_ID:-noslurm}:$(hostname):$$"
 : > "$RUN_DIR/events.log"
 log_event "-" "head_start" "run_dir=$RUN_DIR"
+start_event_tail
 
-python3 - "$LIST_FILE" "$RUN_DIR" <<'PY'
+python3 - "$DATASET_PATH" "$RUN_DIR" "$NUM_SHARDS" <<'PY'
 import argparse
 import sqlite3
 from pathlib import Path
-
-def normalize_dataset_path(raw_path: str) -> Path:
-    return Path(raw_path.strip()).expanduser().resolve()
-
-def load_dataset_paths(list_file):
-    list_path = Path(list_file).expanduser().resolve()
-    paths = []
-    with list_path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            paths.append(normalize_dataset_path(line))
-    return paths
 
 def dataset_cache_path(dataset_path):
     src = Path(dataset_path)
     return src.with_name(f"{src.stem}.hf_distill_cache")
 
-def suggested_num_shards(dataset_path):
-    name = Path(dataset_path).name
-    if name == "medmcqa_with_labels.jsonl":
-        return 32
-    if name == "afrimedqa_v2_full_15275_with_labels.jsonl":
-        return 4
-    if name == "medqa_with_labels_5opt.jsonl":
-        return 4
-    if name == "healthsearchqa_3375_no_labels.jsonl":
-        return 2
-    if name == "afrimedqa_v1_test_3000_with_labels.jsonl":
-        return 2
-    return 1
-
-def prepare_caches(list_file):
+def prepare_cache(dataset_path):
     from datasets import load_dataset, load_from_disk
 
-    dataset_paths = load_dataset_paths(list_file)
-    if not dataset_paths:
-        raise SystemExit(f"No dataset paths found in {list_file}")
-
-    built = 0
-    skipped = 0
-    for dataset_path in dataset_paths:
-        if not dataset_path.exists():
-            print(f"[WARN] Missing dataset, skipping: {dataset_path}")
-            continue
-        cache_path = dataset_cache_path(dataset_path)
-        if cache_path.exists():
-            cached = load_from_disk(str(cache_path))
-            print(f"[SKIP] {dataset_path} -> {cache_path} ({len(cached)} rows)")
-            skipped += 1
-            continue
-        dataset = load_dataset("json", data_files=str(dataset_path), split="train")
-        dataset = dataset.map(
-            lambda _row, idx: {"distilled_source_index": idx},
-            with_indices=True,
-            desc=f"Annotating source indices for {dataset_path.name}",
-            load_from_cache_file=False,
-        )
-        dataset.save_to_disk(str(cache_path))
-        print(f"[OK] {dataset_path} -> {cache_path} ({len(dataset)} rows)")
-        built += 1
-    print(f"Prepared caches: built={built} skipped={skipped}")
+    if not dataset_path.exists():
+        raise SystemExit(f"Input dataset does not exist: {dataset_path}")
+    cache_path = dataset_cache_path(dataset_path)
+    if cache_path.exists():
+        cached = load_from_disk(str(cache_path))
+        print(f"[SKIP] {dataset_path} -> {cache_path} ({len(cached)} rows)")
+        return cache_path
+    dataset = load_dataset("json", data_files=str(dataset_path), split="train")
+    dataset = dataset.map(
+        lambda _row, idx: {"distilled_source_index": idx},
+        with_indices=True,
+        desc=f"Annotating source indices for {dataset_path.name}",
+        load_from_cache_file=False,
+    )
+    dataset.save_to_disk(str(cache_path))
+    print(f"[OK] {dataset_path} -> {cache_path} ({len(dataset)} rows)")
+    return cache_path
 
 
-def init_queue(list_file, run_dir):
+def init_queue(dataset_path, cache_path, run_dir, num_shards):
     rows = []
-    for dataset_path in load_dataset_paths(list_file):
-        cache_path = dataset_cache_path(dataset_path)
-        if not Path(cache_path).exists():
-            raise SystemExit(f"Missing prepared cache for {dataset_path}: {cache_path}")
-        stem = Path(dataset_path).stem
-        num_shards = suggested_num_shards(dataset_path)
-        for shard_index in range(num_shards):
-            shard_id = f"{stem}:s{shard_index + 1:03d}of{num_shards:03d}"
-            rows.append(
-                (
-                    shard_id,
-                    str(dataset_path),
-                    str(cache_path),
-                    int(shard_index),
-                    int(num_shards),
-                    0,
-                    "pending",
-                    None,
-                    None,
-                    "",
-                )
+    if not Path(cache_path).exists():
+        raise SystemExit(f"Missing prepared cache for {dataset_path}: {cache_path}")
+    if num_shards < 1:
+        raise SystemExit("--num-shards must be >= 1")
+    stem = Path(dataset_path).stem
+    for shard_index in range(num_shards):
+        shard_id = f"{stem}:s{shard_index + 1:03d}of{num_shards:03d}"
+        rows.append(
+            (
+                shard_id,
+                str(dataset_path),
+                str(cache_path),
+                int(shard_index),
+                int(num_shards),
+                0,
+                "pending",
+                None,
+                None,
+                "",
             )
+        )
 
-    rows.sort(key=lambda row: (row[1], row[3]))
+    rows.sort(key=lambda row: row[3])
     db_path = Path(run_dir) / "queue.db"
     conn = sqlite3.connect(str(db_path))
     try:
@@ -480,11 +452,13 @@ def init_queue(list_file, run_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("list_file")
+    parser.add_argument("dataset_path")
     parser.add_argument("run_dir")
+    parser.add_argument("num_shards", type=int)
     args = parser.parse_args()
-    prepare_caches(args.list_file)
-    init_queue(args.list_file, args.run_dir)
+    dataset_path = Path(args.dataset_path).expanduser().resolve()
+    cache_path = prepare_cache(dataset_path)
+    init_queue(dataset_path, cache_path, args.run_dir, args.num_shards)
 PY
 
 WORKER_JOB_IDS=()
@@ -586,7 +560,37 @@ PY
 )"
   read -r TOTAL PENDING LEASED DONE FAILED <<<"$SUMMARY_FIELDS"
 
-  echo "[HEAD] total=$TOTAL pending=$PENDING leased=$LEASED done=$DONE failed=$FAILED workers_alive=$WORKERS_ALIVE workers_started=$WORKERS_STARTED"
+  NOW_TS="$(date +%s)"
+  ELAPSED_SECONDS=$((NOW_TS - START_TS))
+  COMPLETED=$((DONE + FAILED))
+  ETA_STR="unknown"
+  if [ "$COMPLETED" -gt 0 ] && [ "$TOTAL" -gt "$COMPLETED" ]; then
+    REMAINING=$((TOTAL - COMPLETED))
+    ETA_SECONDS=$(( (ELAPSED_SECONDS * REMAINING) / COMPLETED ))
+    ETA_STR="$(python3 - "$ETA_SECONDS" <<'PY'
+import sys
+s = int(sys.argv[1])
+h = s // 3600
+m = (s % 3600) // 60
+sec = s % 60
+print(f"{h:02d}:{m:02d}:{sec:02d}")
+PY
+)"
+  elif [ "$TOTAL" -gt 0 ] && [ "$COMPLETED" -ge "$TOTAL" ]; then
+    ETA_STR="00:00:00"
+  fi
+
+  ELAPSED_STR="$(python3 - "$ELAPSED_SECONDS" <<'PY'
+import sys
+s = int(sys.argv[1])
+h = s // 3600
+m = (s % 3600) // 60
+sec = s % 60
+print(f"{h:02d}:{m:02d}:{sec:02d}")
+PY
+)"
+
+  echo "[HEAD] total=$TOTAL pending=$PENDING leased=$LEASED done=$DONE failed=$FAILED workers_alive=$WORKERS_ALIVE workers_started=$WORKERS_STARTED elapsed=$ELAPSED_STR eta=$ETA_STR"
 
   if [ $((DONE + FAILED)) -eq "$TOTAL" ] && [ "$PENDING" -eq 0 ] && [ "$LEASED" -eq 0 ]; then
     log_event "-" "head_complete" "done=$DONE failed=$FAILED"
@@ -636,7 +640,7 @@ if [ "$FAILED_COUNT" -gt 0 ]; then
   exit 1
 fi
 
-python3 - "$LIST_FILE" "$MODEL_NAME" "$STRICT_REPRO" <<'PY'
+python3 - "$DATASET_PATH" "$MODEL_NAME" <<'PY'
 import argparse
 import datetime as dt
 import hashlib
@@ -645,17 +649,6 @@ import math
 import subprocess
 import sys
 from pathlib import Path
-
-def load_dataset_paths(list_file):
-    list_path = Path(list_file).expanduser().resolve()
-    paths = []
-    with list_path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            paths.append(Path(line).expanduser().resolve())
-    return paths
 
 def model_tag(model: str) -> str:
     raw = (model or "").strip().lower()
@@ -720,7 +713,7 @@ def _value_dtype(feature):
     return getattr(feature, "dtype", None)
 
 
-def merge_one(dataset_path, model, strict_repro=False):
+def merge_one(dataset_path, model):
     from datasets import Value, concatenate_datasets, load_dataset
 
     shard_glob = f"{dataset_path.stem}_distillation_{model_tag(model)}.shard-*-of-*.jsonl"
@@ -730,25 +723,7 @@ def merge_one(dataset_path, model, strict_repro=False):
         return 0
 
     shard_datasets = []
-    shard_manifests = []
-    repro_hashes = set()
     for path in shard_files:
-        if strict_repro:
-            manifest_path = path.with_suffix(path.suffix + ".manifest.json")
-            if manifest_path.exists():
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                shard_manifests.append(
-                    {
-                        "path": str(manifest_path),
-                        "repro_config_sha256": manifest.get("repro_config_sha256"),
-                    }
-                )
-                value = manifest.get("repro_config_sha256")
-                if isinstance(value, str) and value.strip():
-                    repro_hashes.add(value.strip())
-            else:
-                raise RuntimeError(f"Missing shard manifest for strict reproducibility: {manifest_path}")
-
         shard_ds = load_dataset("json", data_files=str(path), split="train")
         if "id" in shard_ds.column_names:
             shard_ds = shard_ds.map(
@@ -802,41 +777,10 @@ def merge_one(dataset_path, model, strict_repro=False):
     merged.to_json(str(output_path))
     print(f"[OK] Merged {len(shard_files)} shards into {output_path} ({len(merged)} rows)")
 
-    if strict_repro and len(repro_hashes) != 1:
-        raise RuntimeError(
-            f"Strict reproducibility requires exactly one repro config hash for {dataset_path}, got {sorted(repro_hashes)}"
-        )
-
-    if strict_repro:
-        manifest = {
-            "type": "distillation_merged_manifest",
-            "output_path": str(output_path),
-            "dataset_path": str(dataset_path),
-            "model": model,
-            "num_rows": len(merged),
-            "num_shards": len(shard_files),
-            "shard_files": [str(p) for p in shard_files],
-            "shard_manifests": shard_manifests,
-            "repro_config_sha256_values": sorted(repro_hashes),
-            "strict_repro": True,
-            "output_sha256": file_sha256(output_path),
-            "git_commit_sha": git_commit_sha(),
-            "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        }
-        manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
-        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        print(f"[OK] Wrote merged manifest: {manifest_path}")
     return len(merged)
 
 if __name__ == "__main__":
-    list_file = Path(sys.argv[1]).expanduser().resolve()
+    dataset_path = Path(sys.argv[1]).expanduser().resolve()
     model = sys.argv[2]
-    strict_repro = sys.argv[3].lower() in {"1", "true", "yes"}
-
-    dataset_paths = load_dataset_paths(list_file)
-    if not dataset_paths:
-        raise SystemExit("No dataset paths to merge")
-
-    for dataset_path in dataset_paths:
-        merge_one(dataset_path, model, strict_repro=strict_repro)
+    merge_one(dataset_path, model)
 PY

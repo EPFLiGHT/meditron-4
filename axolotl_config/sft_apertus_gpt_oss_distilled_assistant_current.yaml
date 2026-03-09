@@ -1,0 +1,98 @@
+# ========================
+# Meditron-4 Qwen-3 SFT (GPT-OSS Distillation All)
+# ========================
+base_model: $STORAGE_ROOT/apertus/huggingface/swiss-ai/Apertus-8B-Instruct-2509
+
+output_dir: $STORAGE_ROOT/meditron/models/sft_apertus_gpt_oss_distilled_assistant_current
+
+dataset_prepared_path: $USER_STORAGE/prepared/sft_apertus_gpt_oss_distilled_assistant_current
+load_prepared_dataset: true
+
+wandb_name: sft_apertus_gpt_oss_distilled_assistant_current
+
+# ========================
+# Hardware & Speed
+# ========================
+deepspeed: $PROJECT_ROOT/axolotl_config/deepspeed_zero_3.json
+bf16: true
+tf32: false
+tf16: false
+flash_attention: true
+flash_attn_rms_norm: true
+flash_attn_fuse_qkv: false
+xformers_attention: null
+strict: false
+use_cache: false
+
+# ========================
+# Datasets (GPT-OSS Distillation All)
+# ========================
+datasets:
+  - path: $STORAGE_ROOT/meditron/datasets/distilled/gpt_oss_120b_all/gpt_oss_120b_all_chatonly_distilled_assistant_current.jsonl
+    ds_type: json
+    type: chat_template
+    field_messages: conversations
+    message_property_mappings:
+      role: from
+      content: value
+    roles:
+      system: [system]
+      user: [user, human]
+      assistant: [assistant, gpt]
+
+dataset_processes: 32
+shuffle_merged_datasets: true
+
+# ========================
+# Training Hyperparameters
+# ========================
+type: AutoModelForCausalLM
+tokenizer_type: AutoTokenizer
+sequence_len: 8192
+sample_packing: true
+pad_to_sequence_len: true
+group_by_length: false
+train_on_inputs: false
+
+special_tokens:
+  pad_token: <|end_of_text|>
+
+num_epochs: 1
+micro_batch_size: 4
+gradient_accumulation_steps: 2
+max_grad_norm: 1.0
+
+# ========================
+# Optimization
+# ========================
+optimizer: adamw_torch
+optim_args:
+  fused: true
+learning_rate: 5e-6
+lr_scheduler: cosine
+cosine_min_lr_ratio: 0.1
+warmup_ratio: 0.0
+weight_decay: 0.05
+
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+# ========================
+# Quantization (Disabled)
+# ========================
+load_in_4bit: false
+load_in_8bit: false
+
+# ========================
+# Logging & Evaluation
+# ========================
+logging_steps: 1
+saves_per_epoch: 1
+evals_per_epoch: 0
+eval_set_size: 0.0
+eval_table_size: null
+early_stopping_patience: null
+
+wandb_project: $WANDB_PROJECT
+wandb_entity: $WANDB_ENTITY

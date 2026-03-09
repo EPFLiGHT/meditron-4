@@ -22,7 +22,7 @@ DEFAULT_MAX_RETRIES_PER_SHARD=2
 usage() {
   cat <<EOF2
 Usage:
-  bash $0 --run-dir <path> --model <name> [--request-concurrency C] [--limit N] [--seed N] [--deterministic] [--strict-repro] [--model-revision REV] [--lease-timeout-seconds N] [--heartbeat-seconds N] [--max-retries-per-shard N]
+  bash $0 --run-dir <path> --model <name> [--request-concurrency C] [--limit N] [--lease-timeout-seconds N] [--heartbeat-seconds N] [--max-retries-per-shard N] [--top-logprobs K]
 EOF2
 }
 
@@ -31,13 +31,10 @@ parse_args() {
   MODEL_NAME=""
   REQUEST_CONCURRENCY="$DEFAULT_REQUEST_CONCURRENCY"
   LIMIT_ARG=""
-  SEED_ARG=""
-  DETERMINISTIC=0
-  STRICT_REPRO=0
-  MODEL_REVISION_ARG=""
   LEASE_TIMEOUT_SECONDS="$DEFAULT_LEASE_TIMEOUT_SECONDS"
   HEARTBEAT_SECONDS="$DEFAULT_HEARTBEAT_SECONDS"
   MAX_RETRIES_PER_SHARD="$DEFAULT_MAX_RETRIES_PER_SHARD"
+  TOP_LOGPROBS=4
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -57,20 +54,6 @@ parse_args() {
         shift
         LIMIT_ARG="${1:-}"
         ;;
-      --seed)
-        shift
-        SEED_ARG="${1:-}"
-        ;;
-      --deterministic)
-        DETERMINISTIC=1
-        ;;
-      --strict-repro)
-        STRICT_REPRO=1
-        ;;
-      --model-revision)
-        shift
-        MODEL_REVISION_ARG="${1:-}"
-        ;;
       --lease-timeout-seconds)
         shift
         LEASE_TIMEOUT_SECONDS="${1:-}"
@@ -82,6 +65,10 @@ parse_args() {
       --max-retries-per-shard)
         shift
         MAX_RETRIES_PER_SHARD="${1:-}"
+        ;;
+      --top-logprobs)
+        shift
+        TOP_LOGPROBS="${1:-}"
         ;;
       -h|--help)
         usage
@@ -98,10 +85,6 @@ parse_args() {
 
   if [ -z "$RUN_DIR" ] || [ -z "$MODEL_NAME" ]; then
     usage
-    exit 1
-  fi
-  if [ "$STRICT_REPRO" -eq 1 ] && [ -z "$SEED_ARG" ]; then
-    echo "--seed is required with --strict-repro"
     exit 1
   fi
 }
@@ -449,26 +432,16 @@ run_distill_shard() {
     --shard-index "$SHARD_INDEX"
     --num-shards "$NUM_SHARDS"
     --request-concurrency "$REQUEST_CONCURRENCY"
-    --temperature 0.2
+    --temperature 0.0
+    --top-p 1.0
     --max-tokens 8192
+    --top-logprobs "$TOP_LOGPROBS"
     --retries 5
     --retry-base-seconds 1.5
     --timeout-seconds 180.0
   )
-  if [ -n "$SEED_ARG" ]; then
-    PYTHON_ARGS+=(--seed "$SEED_ARG")
-  fi
   if [ -n "$LIMIT_ARG" ]; then
     PYTHON_ARGS+=(--limit "$LIMIT_ARG")
-  fi
-  if [ "$DETERMINISTIC" -eq 1 ]; then
-    PYTHON_ARGS+=(--deterministic)
-  fi
-  if [ "$STRICT_REPRO" -eq 1 ]; then
-    PYTHON_ARGS+=(--strict-repro)
-  fi
-  if [ -n "$MODEL_REVISION_ARG" ]; then
-    PYTHON_ARGS+=(--model-revision "$MODEL_REVISION_ARG")
   fi
 
   python3 - "${PYTHON_ARGS[@]}" <<'PY'
@@ -477,9 +450,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import json
-import os
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
@@ -494,12 +465,10 @@ def parse_args():
     parser.add_argument("--shard-index", type=int, required=True)
     parser.add_argument("--num-shards", type=int, required=True)
     parser.add_argument("--request-concurrency", type=int, default=8)
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--strict-repro", action="store_true")
-    parser.add_argument("--model-revision", default=None)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-tokens", type=int, default=8192)
+    parser.add_argument("--top-logprobs", type=int, default=4)
     parser.add_argument("--retries", type=int, default=5)
     parser.add_argument("--retry-base-seconds", type=float, default=1.5)
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
@@ -519,41 +488,6 @@ def shard_output_path(dataset_path, shard_index, num_shards, model):
     return src.with_name(
         f"{src.stem}_distillation_{tag}.shard-{shard_index:03d}-of-{num_shards:03d}.jsonl"
     )
-
-
-def normalize_generation_config(args):
-    temperature = args.temperature
-    top_p = None
-    if args.deterministic or args.strict_repro:
-        temperature = 0.0
-        top_p = 1.0
-    return temperature, top_p
-
-
-def resolve_model_revision(args):
-    return (args.model_revision or os.getenv("DISTILL_MODEL_REVISION") or "").strip() or None
-
-
-def build_repro_config(args, temperature, top_p, model_revision):
-    return {
-        "model": args.model,
-        "model_revision": model_revision,
-        "request_concurrency": args.request_concurrency,
-        "temperature": temperature,
-        "top_p": top_p,
-        "max_tokens": args.max_tokens,
-        "retries": args.retries,
-        "retry_base_seconds": args.retry_base_seconds,
-        "timeout_seconds": args.timeout_seconds,
-        "seed": args.seed,
-        "deterministic": bool(args.deterministic or args.strict_repro),
-        "strict_repro": bool(args.strict_repro),
-    }
-
-
-def config_hash(config):
-    payload = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def extract_messages(row):
@@ -666,19 +600,119 @@ def _post_completion_request(base_url, payload, timeout_seconds, retries, retry_
 
 def parse_completion_payload(payload: Any):
     if not isinstance(payload, dict):
-        return "", None
+        return "", None, None
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
-        return "", None
+        return "", None, None
     first = choices[0] if isinstance(choices[0], dict) else {}
     text = first.get("text")
     finish_reason = first.get("finish_reason")
+    token_logprobs = None
+    logprobs_payload = first.get("logprobs")
+    if isinstance(logprobs_payload, dict):
+        tokens = logprobs_payload.get("tokens")
+        token_logprobs_raw = logprobs_payload.get("token_logprobs")
+        top_logprobs_raw = logprobs_payload.get("top_logprobs")
+        if isinstance(tokens, list):
+            token_logprobs = []
+            for idx, token in enumerate(tokens):
+                item = {
+                    "token": token if isinstance(token, str) else str(token),
+                    "logprob": None,
+                    "top_logprobs": {},
+                }
+                if isinstance(token_logprobs_raw, list) and idx < len(token_logprobs_raw):
+                    value = token_logprobs_raw[idx]
+                    if isinstance(value, (int, float)):
+                        item["logprob"] = float(value)
+                if isinstance(top_logprobs_raw, list) and idx < len(top_logprobs_raw):
+                    top_item = top_logprobs_raw[idx]
+                    if isinstance(top_item, dict):
+                        cleaned = {}
+                        for k, v in top_item.items():
+                            if isinstance(v, (int, float)):
+                                cleaned[str(k)] = float(v)
+                        item["top_logprobs"] = cleaned
+                token_logprobs.append(item)
     if isinstance(text, str):
-        return text.strip(), finish_reason if isinstance(finish_reason, str) else None
-    return "", finish_reason if isinstance(finish_reason, str) else None
+        return text.strip(), finish_reason if isinstance(finish_reason, str) else None, token_logprobs
+    return "", finish_reason if isinstance(finish_reason, str) else None, token_logprobs
 
 
-async def request_completion(base_url, timeout_seconds, model, prompt, temperature, max_tokens, seed, top_p, retries, retry_base_seconds):
+def _single_token_id(tokenizer, token_text: str):
+    if not isinstance(token_text, str) or not token_text:
+        return None
+    try:
+        encoded = tokenizer(token_text, add_special_tokens=False)
+        ids = encoded.get("input_ids")
+        if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], int):
+            return int(ids[0])
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def to_axolotl_kd_logprobs(tokenizer, token_logprobs, top_k: int):
+    if not isinstance(token_logprobs, list):
+        return None
+
+    kd_rows = []
+    keep_k = max(1, int(top_k))
+    fallback_token_id = getattr(tokenizer, "unk_token_id", None)
+    if not isinstance(fallback_token_id, int):
+        fallback_token_id = 0
+
+    for pos in token_logprobs:
+        if not isinstance(pos, dict):
+            continue
+        candidates = []
+
+        token_text = pos.get("token")
+        token_lp = pos.get("logprob")
+        if isinstance(token_text, str) and isinstance(token_lp, (int, float)):
+            candidates.append((token_text, float(token_lp)))
+
+        top = pos.get("top_logprobs")
+        if isinstance(top, dict):
+            for k, v in top.items():
+                if isinstance(k, str) and isinstance(v, (int, float)):
+                    candidates.append((k, float(v)))
+
+        # Deduplicate on token id and keep max logprob for each id.
+        by_id = {}
+        for tok_text, lp in candidates:
+            tid = _single_token_id(tokenizer, tok_text)
+            if tid is None:
+                continue
+            prev = by_id.get(tid)
+            if prev is None or lp > prev:
+                by_id[tid] = lp
+
+        if not by_id:
+            # Keep a non-empty row to avoid KD loader failures on empty per-position entries.
+            fallback_lp = float(token_lp) if isinstance(token_lp, (int, float)) else -20.0
+            by_id[fallback_token_id] = fallback_lp
+
+        sorted_items = sorted(by_id.items(), key=lambda x: x[1], reverse=True)[:keep_k]
+        kd_rows.append(
+            [{"token": f"token_id:{tid}", "logprob": float(lp)} for tid, lp in sorted_items]
+        )
+
+    return kd_rows
+
+
+async def request_completion(
+    base_url,
+    timeout_seconds,
+    model,
+    prompt,
+    temperature,
+    max_tokens,
+    top_p,
+    top_logprobs,
+    retries,
+    retry_base_seconds,
+):
     payload = {
         "model": model,
         "prompt": prompt,
@@ -686,10 +720,9 @@ async def request_completion(base_url, timeout_seconds, model, prompt, temperatu
         "max_tokens": max_tokens,
         "skip_special_tokens": False,
     }
-    if seed is not None:
-        payload["seed"] = int(seed)
-    if top_p is not None:
-        payload["top_p"] = float(top_p)
+    if top_logprobs is not None and int(top_logprobs) > 0:
+        payload["logprobs"] = int(top_logprobs)
+    payload["top_p"] = float(top_p)
     loop = asyncio.get_event_loop()
     response_payload = await loop.run_in_executor(
         None,
@@ -706,8 +739,8 @@ async def generate_with_retry(
     prompt,
     temperature,
     max_tokens,
-    seed,
     top_p,
+    top_logprobs,
     retries,
     retry_base_seconds,
 ):
@@ -719,8 +752,8 @@ async def generate_with_retry(
             prompt=prompt,
             temperature=temperature,
             max_tokens=max_tokens,
-            seed=seed,
             top_p=top_p,
+            top_logprobs=top_logprobs,
             retries=retries,
             retry_base_seconds=retry_base_seconds,
         )
@@ -749,17 +782,8 @@ def main():
     args = parse_args()
     from datasets import load_dataset, load_from_disk
 
-    if args.strict_repro and args.seed is None:
-        print("--seed is required when --strict-repro is enabled")
-        return 1
-
-    temperature, top_p = normalize_generation_config(args)
-    model_revision = resolve_model_revision(args)
-    repro = build_repro_config(args, temperature, top_p, model_revision)
-    repro_hash = config_hash(repro)
-    if args.strict_repro and (not model_revision or not repro_hash):
-        print("Strict reproducibility requires model revision and config hash")
-        return 1
+    temperature = float(args.temperature)
+    top_p = float(args.top_p)
 
     dataset_path = Path(args.dataset_path).resolve()
     cache_path = Path(args.dataset_cache).resolve()
@@ -823,10 +847,8 @@ def main():
             "distilled_answer": "",
             "distilled_error": "",
             "distilled_finish_reason": "",
+            "distilled_token_logprobs": [],
         }
-        if args.strict_repro or args.deterministic:
-            result["distilled_config_sha256"] = repro_hash
-            result["distilled_repro"] = repro
         if not messages or prompt_used is None:
             result["distilled_error"] = "No user/human prompt found in conversations"
             return result
@@ -837,7 +859,7 @@ def main():
             return result
 
         try:
-            answer, finish_reason = await generate_with_retry(
+            answer, finish_reason, token_logprobs = await generate_with_retry(
                 args.base_url,
                 args.timeout_seconds,
                 semaphore,
@@ -845,13 +867,19 @@ def main():
                 prompt=rendered_prompt,
                 temperature=temperature,
                 max_tokens=args.max_tokens,
-                seed=args.seed,
                 top_p=top_p,
+                top_logprobs=args.top_logprobs,
                 retries=args.retries,
                 retry_base_seconds=args.retry_base_seconds,
             )
             result["distilled_answer"] = answer
             result["distilled_finish_reason"] = finish_reason or ""
+            if isinstance(token_logprobs, list):
+                result["distilled_token_logprobs"] = to_axolotl_kd_logprobs(
+                    tokenizer,
+                    token_logprobs,
+                    args.top_logprobs,
+                )
         except Exception as exc:  # noqa: BLE001
             result["distilled_error"] = str(exc)
         return result
@@ -913,22 +941,6 @@ def main():
         flush=True,
     )
 
-    if args.strict_repro:
-        manifest = {
-            "type": "distillation_shard_manifest",
-            "output_path": str(output_path),
-            "dataset_path": str(dataset_path),
-            "dataset_cache_path": str(cache_path),
-            "num_rows": written_count,
-            "num_newly_processed": newly_processed_count,
-            "num_errors": error_count,
-            "repro_config_sha256": repro_hash,
-            "repro_config": repro,
-            "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        }
-        manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
-        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        print(f"Wrote manifest: {manifest_path}", flush=True)
     return 0
 
 

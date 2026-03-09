@@ -7,7 +7,7 @@
 #SBATCH --gres gpu:4
 #SBATCH --cpus-per-task 64
 #SBATCH --partition=normal
-#SBATCH --time=2:29:59
+#SBATCH --time=11:59:59
 #SBATCH --environment ../.edf/new_axolotl.toml
 #SBATCH -A a127
 
@@ -243,7 +243,7 @@ python3 -m lm_eval \
   --log_samples \
   --output_path "$OUTPUT_DIR" \
   --include_path "$LM_EVAL_INCLUDE_PATH" \
-  --gen_kwargs max_new_tokens=1024 \
+  --gen_kwargs max_new_tokens=4096 \
   "${LIMIT_ARGS[@]}" \
   --apply_chat_template tokenizer_default 
 else
@@ -256,7 +256,7 @@ accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 --dy
   --log_samples \
   --output_path "$OUTPUT_DIR" \
   --include_path "$LM_EVAL_INCLUDE_PATH" \
-  --gen_kwargs max_new_tokens=1024 \
+  --gen_kwargs max_new_tokens=4096 \
   "${LIMIT_ARGS[@]}" \
   --apply_chat_template tokenizer_default 
 fi
