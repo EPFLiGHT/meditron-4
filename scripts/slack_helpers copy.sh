@@ -94,82 +94,6 @@ _slack_extract_eval_results() {
     echo -e "$output"
 }
 
-_slack_extract_training_loss() {
-    # 1. Determine config path
-    local config_file="${AXOLOTL_CONFIG_FILE:-${FROZEN_CONFIG_PATH:-}}"
-    if [ -z "$config_file" ] || [ ! -f "$config_file" ]; then 
-        echo "[Debug Slack] Config file not found: '$config_file'" >&2
-        return
-    fi
-    
-    # 2. Parse output_dir safely using native AWK (no Python yaml dependency)
-    local model_dir
-    model_dir=$(awk '/^output_dir:/ {print $2}' "$config_file" | tr -d '"' | tr -d "'")
-    
-    if [ -z "$model_dir" ] || [ ! -d "$model_dir" ]; then 
-        echo "[Debug Slack] Model directory not found or invalid: '$model_dir'" >&2
-        return
-    fi
-    
-    # 3. Find trainer_state.json (Root or latest checkpoint folder)
-    local state_file="$model_dir/trainer_state.json"
-    if [ ! -f "$state_file" ]; then
-        # Use find instead of ls for safer recursive searching
-        state_file=$(find "$model_dir" -maxdepth 2 -name "trainer_state.json" | grep "checkpoint-" | sort -V | tail -n 1)
-    fi
-    
-    if [ -z "$state_file" ] || [ ! -f "$state_file" ]; then 
-        echo "[Debug Slack] trainer_state.json not found in $model_dir" >&2
-        return
-    fi
-
-    echo "[Debug Slack] Successfully found state file: $state_file" >&2
-
-    # 4. Generate pure ASCII plot via embedded Python
-    python3 -c '
-import json, sys
-
-def draw(steps, losses, width=45, height=12):
-    if not steps: return "No step data found in logs."
-    min_x, max_x = min(steps), max(steps)
-    min_y, max_y = min(losses), max(losses)
-    if max_x == min_x: max_x += 1e-9
-    if max_y == min_y: max_y += 1e-9
-    
-    grid = [[" " for _ in range(width)] for _ in range(height)]
-    for s, l in zip(steps, losses):
-        x = int((s - min_x) / (max_x - min_x) * (width - 1))
-        y = int((l - min_y) / (max_y - min_y) * (height - 1))
-        grid[height - 1 - y][x] = "•"
-        
-    out = [f"Max: {max_y:.4f}"]
-    out.append("   ┌" + "─" * width + "┐")
-    for i, row in enumerate(grid):
-        if i == 0: lbl = f"{max_y:.2f}"
-        elif i == height - 1: lbl = f"{min_y:.2f}"
-        elif i == height // 2: lbl = f"{(max_y+min_y)/2:.2f}"
-        else: lbl = ""
-        out.append(f"{lbl:>5}│{''.join(row)}│")
-        
-    out.append("   └" + "─" * width + "┘")
-    out.append(f"Min: {min_y:.4f} {' '*(width - 25)} Steps: {min_x}➔{max_x}")
-    return "\n".join(out)
-
-try:
-    with open(sys.argv[1], "r") as f:
-        data = json.load(f)
-    steps, losses = [], []
-    for log in data.get("log_history", []):
-        if "loss" in log and "step" in log:
-            steps.append(log["step"])
-            losses.append(log["loss"])
-    print(draw(steps, losses))
-except Exception as e:
-    # Print the error so it shows up in Slack instead of failing silently
-    print(f"Error parsing JSON for plot: {e}")
-' "$state_file"
-}
-
 _slack_build_payload() {
     local text="$1"
     local payload=""
@@ -237,21 +161,6 @@ Exit code: ${rc}"
 Failed at: ${FAILED_CMD}"
     fi
 
-    # ---- ADDED: Training Loss Plot Injection ----
-    if [ "$phase" = "train" ]; then
-        local loss_plot
-        loss_plot="$(_slack_extract_training_loss)"
-        if [ -n "$loss_plot" ]; then
-            text="${text}
-
-*Training Loss:*
-\`\`\`
-${loss_plot}
-\`\`\`"
-        fi
-    fi
-    # ---------------------------------------------
-
     reports_dir="${SLACK_REPORTS_DIR:-${PROJECT_ROOT:-.}/reports}"
     if [ -n "${SLACK_REPORT_FILE:-}" ]; then
         report_file="$SLACK_REPORT_FILE"
@@ -263,7 +172,7 @@ ${loss_plot}
         report_file=""
     fi
 
-    if [ -n "$report_file" ] && [ -f "$report_file" ]; then
+if [ -n "$report_file" ] && [ -f "$report_file" ]; then
         if [ "$rc" -eq 0 ]; then
             # If successful, extract the evaluation table and stats
             local eval_results

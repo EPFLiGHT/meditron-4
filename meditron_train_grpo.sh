@@ -2,13 +2,12 @@
 #SBATCH --job-name meditron-default-job
 #SBATCH --output train_reports/R-%x.%j.err
 #SBATCH --error train_reports/R-%x.%j.err
-#SBATCH --nodes 4
+#SBATCH --nodes 1
 #SBATCH --ntasks-per-node 1
 #SBATCH --gres gpu:4
 #SBATCH --cpus-per-task 64
 #SBATCH --partition=debug
 #SBATCH --time 1:29:59
-#SBATCH --environment ../.edf/new_axolotl.toml
 #SBATCH -A a127
 
 ulimit -c 0 # prevents core dumps
@@ -135,11 +134,20 @@ echo "🛠️  Pre-creating scratch directories on all $SLURM_NNODES nodes..."
 
 export TMPDIR=/iopsstor/scratch/cscs/$USER/tmp
 mkdir -p "$TMPDIR"
+
+# srun --ntasks-per-node=1 \
+#      --cpus-per-task=1 \
+#      --nodes=$SLURM_NNODES \
+#      -A a127 \
+#      --reservation=sai-a127 \
+#      --environment ../.edf/grpo.toml \
+#      bash -c "mkdir -p $LOCAL_TMP $LOCAL_HF $LOCAL_DS $LOCAL_TRITON $LOCAL_WANDB/wandb && ulimit -n 65535"
+
 srun --ntasks-per-node=1 \
      --cpus-per-task=1 \
      --nodes=$SLURM_NNODES \
      -A a127 \
-     #--reservation=sai-a127 \
+    --environment ../.edf/grpo.toml \
      bash -c "mkdir -p $LOCAL_TMP $LOCAL_HF $LOCAL_DS $LOCAL_TRITON $LOCAL_WANDB/wandb && ulimit -n 65535"
 
 if [ $? -ne 0 ]; then
@@ -192,12 +200,21 @@ echo "Command: $FULL_CMD"
 
 LOG_FILE="$PROJECT_ROOT/train_reports/R-${SLURM_JOB_NAME}.${SLURM_JOB_ID}.err"
 
+# srun \
+#     --cpus-per-task $SLURM_CPUS_PER_TASK \
+#     --jobid $SLURM_JOB_ID \
+#     --wait 60 \
+#     -A a127 \
+#     --reservation=sai-a127 \
+#     --environment ../.edf/grpo.toml \
+#     bash -c "$FULL_CMD"
+
 srun \
     --cpus-per-task $SLURM_CPUS_PER_TASK \
     --jobid $SLURM_JOB_ID \
     --wait 60 \
     -A a127 \
-    #--reservation=sai-a127 \
+    --environment ../.edf/grpo.toml \
     bash -c "$FULL_CMD"
 TRAIN_RC=$?
 

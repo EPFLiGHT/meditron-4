@@ -2,12 +2,11 @@
 #SBATCH --job-name meditron-default-job
 #SBATCH --output train_reports/R-%x.%j.err
 #SBATCH --error train_reports/R-%x.%j.err
-#SBATCH --nodes 4
+#SBATCH --nodes 8
 #SBATCH --ntasks-per-node 1
 #SBATCH --gres gpu:4
-#SBATCH --cpus-per-task 64
-#SBATCH --partition=debug
-#SBATCH --time 1:29:59
+#SBATCH --cpus-per-task 256
+#SBATCH --time 5:59:59
 #SBATCH --environment ../.edf/new_axolotl.toml
 #SBATCH -A a127
 
@@ -57,7 +56,7 @@ if [ -z "$SLURM_JOB_ID" ]; then
     #EVAL_SCRIPT_NO_COT="$PROJECT_ROOT/meditron_eval_no_cot.sh"
     # LOGITS_SCRIPT="$PROJECT_ROOT/meditron_eval_logits.sh"
 
-    EVAL_SUBMIT_OUT="$(sbatch --dependency=afterok:"$JOB_ID" -J "eval_${JOB_NAME}" "$EVAL_SCRIPT" "$MODEL_PATH")"
+    EVAL_SUBMIT_OUT="$(sbatch --dependency=afterok:"$JOB_ID" -J "${JOB_NAME}-eval" "$EVAL_SCRIPT" "$MODEL_PATH")"
     EVAL_JOB_ID="$(echo "$EVAL_SUBMIT_OUT" | awk '{print $4}')"
     echo "🧪 Submitted eval job (afterok:$JOB_ID): $EVAL_JOB_ID"
 
@@ -129,24 +128,23 @@ LOCAL_TRITON="$JOB_SCRATCH/triton"
 LOCAL_WANDB="$JOB_SCRATCH/wandb"
 mkdir -p "$LOCAL_TMP" "$LOCAL_HF" "$LOCAL_DS" "$LOCAL_TRITON" "$LOCAL_WANDB"
 
-# 4. PRE-FLIGHT CHECK: Create Directories on ALL Nodes
-# Added: -A and --reservation to match the main job parameters
-echo "🛠️  Pre-creating scratch directories on all $SLURM_NNODES nodes..."
+echo "🛠️  Cleaning environment and pre-creating scratch directories on all $SLURM_NNODES nodes..."
 
 export TMPDIR=/iopsstor/scratch/cscs/$USER/tmp
 mkdir -p "$TMPDIR"
+
 srun --ntasks-per-node=1 \
      --cpus-per-task=1 \
      --nodes=$SLURM_NNODES \
      -A a127 \
-     #--reservation=sai-a127 \
-     bash -c "mkdir -p $LOCAL_TMP $LOCAL_HF $LOCAL_DS $LOCAL_TRITON $LOCAL_WANDB/wandb && ulimit -n 65535"
+     --reservation=sai-a127 \
+     bash -c "pip uninstall -y causal-conv1d && mkdir -p $LOCAL_TMP $LOCAL_HF $LOCAL_DS $LOCAL_TRITON $LOCAL_WANDB/wandb && ulimit -n 65535"
 
 if [ $? -ne 0 ]; then
-    echo "❌ CRITICAL: Failed to create scratch directories on remote nodes."
+    echo "❌ CRITICAL: Failed to run pre-flight checks on remote nodes."
     exit 1
 fi
-echo "✅ Scratch directories ready."
+echo "✅ Environment cleaned and scratch directories ready."
 
 # 5. Export Environment
 export TMPDIR="$LOCAL_TMP"
@@ -197,7 +195,7 @@ srun \
     --jobid $SLURM_JOB_ID \
     --wait 60 \
     -A a127 \
-    #--reservation=sai-a127 \
+    --reservation=sai-a127 \
     bash -c "$FULL_CMD"
 TRAIN_RC=$?
 

@@ -1,0 +1,85 @@
+# ==========================================
+# Base Model & Tokenizer
+# ==========================================
+wandb_name: sft_qwen_gpt_oss_with_retries_reasoning_low_new_no_reasoning
+output_dir: $STORAGE_ROOT/meditron/models/sft_qwen_gpt_oss_with_retries_reasoning_low_new_no_reasoning
+dataset_prepared_path: $USER_STORAGE/prepared/sft_qwen_gpt_oss_with_retries_reasoning_low_new_no_reasoning
+
+base_model: /iopsstor/scratch/cscs/theimer/models/Qwen2.5-7B-Instruct
+model_type: AutoModelForCausalLM
+tokenizer_type: AutoTokenizer
+is_qwen2_derived_model: true
+trust_remote_code: true
+
+# ==========================================
+# Hardware & Precision
+# ==========================================
+load_in_8bit: false
+load_in_4bit: false
+strict: false
+bf16: auto          # Uses bfloat16 if your GPU supports it (Ampere+), otherwise fp16
+fp16: false
+tf32: true          # Enable if using Ampere GPUs (RTX 30xx/A100) for faster matmuls
+flash_attention: true # Highly recommended for Qwen 2.5
+
+# ==========================================
+# Dataset & Formatting
+# ==========================================
+chat_template: qwen_25
+datasets:
+  - path: /users/theimer/meditron-4/meditron_4_gpt_oss_with_retries_reasoning_low_resumed_cleaned_no_system_no_reasoning.jsonl
+    ds_type: json
+    type: chat_template
+    field_messages: conversations
+    message_property_mappings:
+      role: from
+      content: value
+    roles:
+      system: [system]
+      user: [user, human]
+      assistant: [assistant, gpt]
+
+val_set_size: 0.05
+
+
+sequence_len: 4096       # Qwen 2.5 supports up to 128k, but 4096-8192 is standard for FT
+sample_packing: true     # Packs multiple short examples into one sequence for massive speedups
+eval_sample_packing: false
+pad_to_sequence_len: true
+
+# ==========================================
+# Training Hyperparameters
+# ==========================================
+num_epochs: 3
+micro_batch_size: 4             # Per-GPU batch size. Reduce to 1 if you hit OOM.
+gradient_accumulation_steps: 2  # Effective batch size = micro * grad_acc * GPUs
+gradient_checkpointing: true    # Saves VRAM by recomputing activations
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+optimizer: adamw_torch          # Standard full-precision optimizer for Full FT
+learning_rate: 2e-5             # Lower LR for Full FT (Use 2e-4 if using LoRA)
+lr_scheduler: cosine
+warmup_ratio: 0.03                # Or warmup_ratio: 0.03
+weight_decay: 0.01
+
+train_on_inputs: false          # Only train on the assistant's responses, mask the user prompts
+group_by_length: false
+
+# ==========================================
+# Logging & Evaluation
+# ==========================================
+logging_steps: 1
+evals_per_epoch: 4
+eval_max_new_tokens: 128
+saves_per_epoch: 1
+wandb_project: $WANDB_PROJECT
+wandb_entity: $WANDB_ENTITY
+wandb_watch:
+
+
+# ==========================================
+# DeepSpeed (Required for Full FT of 7B+ models)
+# ==========================================
+deepspeed: $PROJECT_ROOT/axolotl_config/deepspeed_zero_3.json
+

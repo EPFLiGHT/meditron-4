@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name meditron-eval
+#SBATCH --job-name meditron-eval-vllm-no-cot
 #SBATCH --output eval_reports/R-%x.%j.err
 #SBATCH --error eval_reports/R-%x.%j.err
 #SBATCH --nodes 1
 #SBATCH --ntasks-per-node 1
 #SBATCH --gres gpu:4
-#SBATCH --cpus-per-task 64
+#SBATCH --cpus-per-task 256
 #SBATCH --partition=normal
 #SBATCH --time=11:59:59
-#SBATCH --environment ../.edf/new_axolotl.toml
+#SBATCH --environment ../.edf/inference.toml
 #SBATCH -A a127
 
 ulimit -c 0 # prevents core dumps
@@ -23,7 +23,7 @@ source "$SCRIPT_DIR/scripts/slack_helpers.sh"
 # =========================================================
 
 if [ -z "$SLURM_JOB_ID" ]; then
-    RUN_NAME="meditron-eval-no-cot"
+    RUN_NAME="meditron-eval-vllm-no-cot"
     MODEL_PATH="$1"
     DEBUG_FLAG=0
     MODEL_PARALLELISM=0
@@ -198,6 +198,8 @@ export HF_DATASETS_TRUST_REMOTE_CODE=1
 export TRITON_CACHE_DIR=$USER_STORAGE/triton
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 unset TRANSFORMERS_CACHE
+# Required on some clusters/PyTorch builds: avoid CUDA init in forked subprocesses.
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 
 export LM_EVAL_INCLUDE_PATH="/users/$USER/lm-evaluation-harness/lm_eval/tasks"
 
@@ -219,7 +221,6 @@ if [ "$DEBUG_FLAG" -eq 1 ]; then
     LIMIT_ARGS=(--limit 100)
 fi
 
-#MODEL_ARGS="pretrained=$MODEL_PATH,dtype=bfloat16,attn_implementation=flash_attention_3,trust_remote_code=True"
 TOKENIZER_ARGS=""
 if [ -f "$MODEL_PATH/config.json" ] && rg -q '"model_type"\s*:\s*"apertus"' "$MODEL_PATH/config.json"; then
     APERTUS_TOKENIZER_PATH="${APERTUS_TOKENIZER_PATH:-$STORAGE_ROOT/apertus/huggingface/swiss-ai/Apertus-8B-Instruct-2509}"
@@ -230,36 +231,24 @@ if [ -f "$MODEL_PATH/config.json" ] && rg -q '"model_type"\s*:\s*"apertus"' "$MO
         echo "Apertus model detected but fallback tokenizer path not found: $APERTUS_TOKENIZER_PATH"
     fi
 fi
-MODEL_ARGS="pretrained=$MODEL_PATH,dtype=bfloat16,attn_implementation=flash_attention_2,trust_remote_code=True$TOKENIZER_ARGS"
-TASKS="medbench_no_cot"
+NUM_GPUS="${SLURM_GPUS_ON_NODE:-4}"
+TP_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-$NUM_GPUS}"
+DP_SIZE="${VLLM_DATA_PARALLEL_SIZE:-1}"
+GPU_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
+MODEL_ARGS="pretrained=$MODEL_PATH,dtype=bfloat16,trust_remote_code=True,tensor_parallel_size=$TP_SIZE,data_parallel_size=$DP_SIZE,gpu_memory_utilization=$GPU_MEM_UTIL,max_model_len=$MAX_MODEL_LEN,max_gen_toks=4096$TOKENIZER_ARGS"
 
-if [ "$MODEL_PARALLELISM" -eq 1 ]; then
 python3 -m lm_eval \
-  --model hf \
-  --model_args "$MODEL_ARGS,parallelize=True" \
-  --tasks "$TASKS" \
-  --batch_size 16 \
-  --verbosity "DEBUG" \
-  --log_samples \
-  --output_path "$OUTPUT_DIR" \
-  --include_path "$LM_EVAL_INCLUDE_PATH" \
-  --gen_kwargs max_new_tokens=4096 \
-  "${LIMIT_ARGS[@]}" \
-  --apply_chat_template tokenizer_default 
-else
-accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 --dynamo_backend no -m lm_eval \
-  --model hf \
+  --model vllm \
   --model_args "$MODEL_ARGS" \
-  --tasks "$TASKS" \
-  --batch_size 16 \
+  --tasks medbench_no_cot \
+  --batch_size auto \
   --verbosity "DEBUG" \
   --log_samples \
   --output_path "$OUTPUT_DIR" \
   --include_path "$LM_EVAL_INCLUDE_PATH" \
-  --gen_kwargs max_new_tokens=4096 \
   "${LIMIT_ARGS[@]}" \
   --apply_chat_template tokenizer_default 
-fi
 
 echo "END TIME: $(date)"
 

@@ -2,12 +2,11 @@
 #SBATCH --job-name meditron-default-job
 #SBATCH --output train_reports/R-%x.%j.err
 #SBATCH --error train_reports/R-%x.%j.err
-#SBATCH --nodes 4
+#SBATCH --nodes 8
 #SBATCH --ntasks-per-node 1
 #SBATCH --gres gpu:4
-#SBATCH --cpus-per-task 64
-#SBATCH --partition=debug
-#SBATCH --time 1:29:59
+#SBATCH --cpus-per-task 256
+#SBATCH --time 5:59:59
 #SBATCH --environment ../.edf/new_axolotl.toml
 #SBATCH -A a127
 
@@ -45,19 +44,31 @@ if [ -z "$SLURM_JOB_ID" ]; then
     JOB_ID=$(echo "$SUBMISSION_OUTPUT" | awk '{print $4}')
     echo "🚀 Submitted Job: $JOB_ID"
 
-    # Avoid bash here-doc temp files (can fail if shared /tmp has no space/inodes).
     MODEL_PATH="$(python3 -c 'import sys, yaml; cfg=yaml.safe_load(open(sys.argv[1], "r", encoding="utf-8")) or {}; print((cfg.get("output_dir", "") or "").strip())' "$DEST_CFG")"
     if [ -z "$MODEL_PATH" ]; then
-    echo "❌ Could not read output_dir from $DEST_CFG"
-    exit 1
+        echo "❌ Could not read output_dir from $DEST_CFG"
+        exit 1
     fi
     echo "📦 Model path (from output_dir): $MODEL_PATH"
 
-    EVAL_SCRIPT="$PROJECT_ROOT/meditron_eval.sh"
-    #EVAL_SCRIPT_NO_COT="$PROJECT_ROOT/meditron_eval_no_cot.sh"
-    # LOGITS_SCRIPT="$PROJECT_ROOT/meditron_eval_logits.sh"
+    # =========================================================
+    # NEW: W&B Linking Logic 
+    # =========================================================
+    # 1. Read W&B project from Axolotl config (fallback to "meditron")
+    export WANDB_PROJECT="$(python3 -c 'import sys, yaml; cfg=yaml.safe_load(open(sys.argv[1], "r", encoding="utf-8")) or {}; print(cfg.get("wandb_project", "meditron"))' "$DEST_CFG")"
+    
+    # 2. Generate a deterministic W&B Run ID (8 alphanumeric characters)
+    export WANDB_RUN_ID=$(python3 -c "import string,random; print(''.join(random.choices(string.ascii_lowercase + string.digits, k=8)))")
+    echo "🔗 W&B Setup: Project=$WANDB_PROJECT | Shared Run ID=$WANDB_RUN_ID"
+    # =========================================================
 
-    EVAL_SUBMIT_OUT="$(sbatch --dependency=afterok:"$JOB_ID" -J "eval_${JOB_NAME}" "$EVAL_SCRIPT" "$MODEL_PATH")"
+    EVAL_SCRIPT="$PROJECT_ROOT/meditron_eval_2.sh"
+
+    # 3. Modify sbatch to explicitly export the W&B variables so the eval job inherits them
+    EVAL_SUBMIT_OUT="$(sbatch --dependency=afterok:"$JOB_ID" \
+        --export=ALL,WANDB_PROJECT="$WANDB_PROJECT",WANDB_RUN_ID="$WANDB_RUN_ID" \
+        -J "eval_${JOB_NAME}" "$EVAL_SCRIPT" "$MODEL_PATH")"
+    
     EVAL_JOB_ID="$(echo "$EVAL_SUBMIT_OUT" | awk '{print $4}')"
     echo "🧪 Submitted eval job (afterok:$JOB_ID): $EVAL_JOB_ID"
 
@@ -139,7 +150,7 @@ srun --ntasks-per-node=1 \
      --cpus-per-task=1 \
      --nodes=$SLURM_NNODES \
      -A a127 \
-     #--reservation=sai-a127 \
+     --reservation=sai-a127 \
      bash -c "mkdir -p $LOCAL_TMP $LOCAL_HF $LOCAL_DS $LOCAL_TRITON $LOCAL_WANDB/wandb && ulimit -n 65535"
 
 if [ $? -ne 0 ]; then
@@ -197,7 +208,7 @@ srun \
     --jobid $SLURM_JOB_ID \
     --wait 60 \
     -A a127 \
-    #--reservation=sai-a127 \
+    --reservation=sai-a127 \
     bash -c "$FULL_CMD"
 TRAIN_RC=$?
 

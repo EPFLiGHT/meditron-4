@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ==========================================
+# 1. Argument Parsing & Setup
+# ==========================================
 SHOW_SAMPLE=0
 ONLY_COMPLETED=0
 args=()
+
 for arg in "$@"; do
   if [ "$arg" = "--show_sample" ]; then
     SHOW_SAMPLE=1
@@ -21,28 +25,13 @@ if [ ! -d "$REPORTS_DIR" ]; then
   echo "Reports directory not found: $REPORTS_DIR" >&2
   exit 1
 fi
+
 if [ ! -d "$EVAL_RESULTS_DIR" ]; then
   echo "Eval results directory not found: $EVAL_RESULTS_DIR" >&2
   exit 1
 fi
 
-shopt -s nullglob
-mapfile -d '' report_files < <(find "$REPORTS_DIR" -maxdepth 1 -type f -print0)
-if [ "${#report_files[@]}" -eq 0 ]; then
-  echo "No report files found in $REPORTS_DIR" >&2
-  exit 0
-fi
-
-sorted_reports=()
-while IFS= read -r report; do
-  sorted_reports+=("$report")
-done < <(
-  printf '%s\0' "${report_files[@]}" \
-    | xargs -0 stat -c '%Y %n' \
-    | sort -n \
-    | awk '{$1=""; sub(/^ /,""); print}'
-)
-
+# Determine the best search tool
 if command -v rg >/dev/null 2>&1; then
   line_cmd=(rg -n -m1)
   grep_cmd=(rg -n)
@@ -52,6 +41,10 @@ else
   grep_cmd=(grep -n)
   has_rg=0
 fi
+
+# ==========================================
+# 2. Helper Functions
+# ==========================================
 
 count_invalids_recursive() {
   local dir="$1"
@@ -74,23 +67,22 @@ count_invalids_recursive() {
 
 count_lines_recursive() {
   local dir="$1"
-  local total=0
-  total=$(
-    find "$dir" -type f -name "*.jsonl" -print0 \
-      | xargs -0 -r wc -l 2>/dev/null \
-      | awk '{sum += $1} END {print sum + 0}'
-  )
-  echo "$total"
+  find "$dir" -type f -name "*.jsonl" -print0 \
+    | xargs -0 -r wc -l 2>/dev/null \
+    | awk '{sum += $1} END {print sum + 0}'
 }
 
 eval_resps_stats() {
   local eval_dir="$1"
   local jsonl_path=""
   jsonl_path="$(find "$eval_dir" -type f -name "*.jsonl" | sort | head -n1)"
+  
   if [ -z "$jsonl_path" ]; then
     echo -e "n/a\tn/a\tn/a"
     return
   fi
+
+  # Preserved exact Python logic from original script
   python3 - "$jsonl_path" <<'PY' 2>/dev/null || true
 import json
 import sys
@@ -137,10 +129,12 @@ print_invalids_for_report() {
   local report="$1"
   local base
   local job_id=""
+  
   base="$(basename "$report")"
   if [[ "$base" =~ \.([0-9]+)\. ]]; then
     job_id="${BASH_REMATCH[1]}"
   fi
+  
   if [ -z "$job_id" ]; then
     echo "Invalids: n/a"
     return
@@ -163,6 +157,7 @@ print_invalids_for_report() {
     invalid_total=$((invalid_total + $(count_invalids_recursive "$dir")))
     line_total=$((line_total + $(count_lines_recursive "$dir")))
   done
+  
   if [ "$line_total" -eq 0 ]; then
     echo "Invalids: 0/0"
     echo "Eval folder: ${matches[*]}"
@@ -172,10 +167,14 @@ print_invalids_for_report() {
     echo "Resps mean length: n/a"
     return
   fi
+  
   local percent
+  # Preserved exact 4-decimal precision
   percent=$(awk -v a="$invalid_total" -v b="$line_total" 'BEGIN {printf "%.4f", (a / b) * 100}')
+  
   echo "Invalids: ${invalid_total}/${line_total} (${percent}%)"
   echo "Eval folder: ${matches[*]}"
+  
   IFS=$'\t' read -r first_resps first_len mean_len < <(eval_resps_stats "${matches[0]}")
   if [ "$SHOW_SAMPLE" -eq 1 ]; then
     echo "First resps: ${first_resps}"
@@ -183,9 +182,33 @@ print_invalids_for_report() {
   echo "Resps mean length: ${mean_len}"
 }
 
+# ==========================================
+# 3. Main Execution Loop
+# ==========================================
+
+shopt -s nullglob
+mapfile -d '' report_files < <(find "$REPORTS_DIR" -maxdepth 1 -type f -print0)
+if [ "${#report_files[@]}" -eq 0 ]; then
+  echo "No report files found in $REPORTS_DIR" >&2
+  exit 0
+fi
+
+# Preserved exact sorting logic
+sorted_reports=()
+while IFS= read -r report; do
+  sorted_reports+=("$report")
+done < <(
+  printf '%s\0' "${report_files[@]}" \
+    | xargs -0 stat -c '%Y %n' \
+    | sort -n \
+    | awk '{$1=""; sub(/^ /,""); print}'
+)
+
 for report in "${sorted_reports[@]}"; do
+  # Preserved exact exit code parsing
   exit_code="$(awk -F'Exit code: ' '/Exit code:/{code=$2} END{if(code!="") print code}' "$report" | sed -E 's/[^0-9].*$//')"
   status="UNKNOWN"
+  
   if [ -n "$exit_code" ]; then
     if [ "$exit_code" = "0" ]; then
       status="COMPLETED"
@@ -193,12 +216,14 @@ for report in "${sorted_reports[@]}"; do
       status="FAILED (exit code $exit_code)"
     fi
   fi
+  
   if [ "$ONLY_COMPLETED" -eq 1 ] && [ "$status" != "COMPLETED" ]; then
     continue
   fi
 
   echo "== $report =="
 
+  # Preserved exact hierarchical model parsing (MODEL_PATH then pretrained)
   model_line="$("${line_cmd[@]}" "MODEL_PATH=" "$report" || true)"
   model=""
   if [ -n "$model_line" ]; then
@@ -218,6 +243,7 @@ for report in "${sorted_reports[@]}"; do
 
   echo "Status: $status"
 
+  # Preserved exact results table parsing
   results_table="$(awk '
     /^\|[[:space:]]*Tasks[[:space:]]*\|/ {in_table=1; print; next}
     in_table && /^\|/ {print; next}
@@ -239,6 +265,7 @@ for report in "${sorted_reports[@]}"; do
     fi
 
     if [ -z "$error_summary" ]; then
+      # Preserved exact fallback error parsing
       error_summary="$("${line_cmd[@]}" "ERROR:|Error:|FAILED|exit code: [1-9]" "$report" 2>/dev/null || true)"
     fi
 

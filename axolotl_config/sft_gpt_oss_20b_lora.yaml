@@ -1,0 +1,119 @@
+# ========================
+# GPT-OSS-20B LoRA SFT
+# ========================
+base_model: openai/gpt-oss-20b
+
+output_dir: $STORAGE_ROOT/meditron/models/gpt-oss-20b-lora-sft
+
+dataset_prepared_path: $USER_STORAGE/prepared/gpt-oss-20b-lora-sft
+load_prepared_dataset: true
+
+wandb_name: gpt-oss-20b-lora-sft
+
+# ========================
+# Model Loading
+# ========================
+use_kernels: true
+model_quantization_config: Mxfp4Config
+model_quantization_config_kwargs:
+  dequantize: true
+
+plugins:
+  - axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin
+
+# Prevent pre-sharding model placement from blowing up GPU memory.
+experimental_skip_move_to_device: true
+
+# ========================
+# Hardware & Speed
+# ========================
+deepspeed: $PROJECT_ROOT/axolotl_config/deepspeed_zero_3.json
+bf16: true
+tf32: true
+tf16: false
+flash_attention: true
+strict: false
+use_cache: false
+activation_offloading: true
+
+# Not needed if your environment already has flash-attn >= 2.8.3.
+attn_implementation: kernels-community/vllm-flash-attn3
+
+# ========================
+# Datasets
+# ========================
+datasets:
+  - path: $STORAGE_ROOT/meditron/datasets/distilled/meditron4_mixture/meditron4_mixture_current.jsonl
+    ds_type: json
+    type: chat_template
+    field_messages: conversations
+    message_property_mappings:
+      role: from
+      content: value
+    roles:
+      system: [system]
+      user: [user, human]
+      assistant: [assistant, gpt]
+
+dataset_processes: 32
+shuffle_merged_datasets: true
+
+# ========================
+# Training Hyperparameters
+# ========================
+type: AutoModelForCausalLM
+tokenizer_type: AutoTokenizer
+sequence_len: 4096
+sample_packing: true
+pad_to_sequence_len: true
+group_by_length: false
+train_on_inputs: false
+
+num_epochs: 1
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+max_grad_norm: 1.0
+
+gradient_checkpointing: true
+
+# ========================
+# LoRA
+# ========================
+adapter: lora
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.0
+lora_target_linear: true
+
+# MoE expert adapters are the next thing to enable once your Axolotl/PEFT
+# version supports them cleanly for GPT-OSS.
+# lora_target_parameters:
+#   - "model.layers.22.mlp.experts.gate_up_proj"
+#   - "model.layers.22.mlp.experts.down_proj"
+#   - "model.layers.23.mlp.experts.gate_up_proj"
+#   - "model.layers.23.mlp.experts.down_proj"
+
+# ========================
+# Optimization
+# ========================
+optimizer: adamw_torch_8bit
+learning_rate: 2e-4
+lr_scheduler: constant_with_warmup
+warmup_ratio: 0.1
+weight_decay: 0.0
+
+# ========================
+# Logging & Evaluation
+# ========================
+logging_steps: 1
+saves_per_epoch: 1
+evals_per_epoch: 0
+eval_set_size: 0.0
+eval_table_size: null
+early_stopping_patience: null
+
+wandb_project: $WANDB_PROJECT
+wandb_entity: $WANDB_ENTITY
+
+eot_tokens:
+  - "<|end|>"

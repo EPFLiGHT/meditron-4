@@ -1,8 +1,0 @@
-/capstor/store/cscs/swissai/a127/meditron/datasets/masked/medqa/medqa_with_labels_5opt.jsonl
-/capstor/store/cscs/swissai/a127/meditron/datasets/masked/medmcqa/medmcqa_with_labels.jsonl
-/capstor/store/cscs/swissai/a127/meditron/datasets/masked/pubmedqa/pubmedqa_pqa_labeled_1000_medgemma_style_with_labels.jsonl
-/capstor/store/cscs/swissai/a127/meditron/datasets/masked/medexpqa/medexpqa_train_434.jsonl 
-/capstor/store/cscs/swissai/a127/meditron/datasets/masked/afrimedqa/afrimedqa_v1_test_3000_with_labels.jsonl
-/capstor/store/cscs/swissai/a127/meditron/datasets/masked/afrimedqa/afrimedqa_v2_full_15275_with_labels.jsonl
-/capstor/store/cscs/swissai/a127/meditron/datasets/masked/healthsearchqa/healthsearchqa_3375_no_labels.jsonl
-/capstor/store/cscs/swissai/a127/meditron/datasets/masked/liveqa/liveqa_truehealth_635_with_labels.jsonl

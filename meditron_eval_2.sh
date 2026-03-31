@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name meditron-eval
+#SBATCH --job-name meditron-eval-vllm
 #SBATCH --output eval_reports/R-%x.%j.err
 #SBATCH --error eval_reports/R-%x.%j.err
 #SBATCH --nodes 1
@@ -7,23 +7,17 @@
 #SBATCH --gres gpu:4
 #SBATCH --cpus-per-task 256
 #SBATCH --partition=normal
-#SBATCH --time=0:29:59
-#SBATCH --environment ../.edf/new_axolotl.toml
+#SBATCH --time=11:59:59
+#SBATCH --environment ../.edf/inference.toml
 #SBATCH -A a127
 
-ulimit -c 0 # prevents core dumps
-
-
-# Prefer the submit directory (available on workers) so we can find helpers after sbatch copies the script to /var/spool.
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 source "$SCRIPT_DIR/scripts/slack_helpers.sh"
 
-# =========================================================
-# PHASE 1: SUBMISSION LOGIC (Runs on Login Node)
-# =========================================================
+# PHASE 1: SUBMISSION LOGIC /LOGIN NODE
 
 if [ -z "$SLURM_JOB_ID" ]; then
-    RUN_NAME="meditron-eval-logits"
+    RUN_NAME="meditron-eval-vllm"
     MODEL_PATH="$1"
     DEBUG_FLAG=0
     MODEL_PARALLELISM=0
@@ -95,9 +89,7 @@ fi
 
 
 
-# =========================================================
-# PHASE 2: WORKER LOGIC (Runs on Compute Node)
-# =========================================================
+# PHASE 2: WORKER LOGIC / COMPUTE NODE
 
 RUN_NAME="$1"
 MODEL_PATH="$2"
@@ -122,7 +114,7 @@ if [ -z "$MODEL_PATH" ] && [ -n "$RUN_NAME" ]; then
 fi
 
 if [ -z "$RUN_NAME" ]; then
-    RUN_NAME="eval-logits"
+    RUN_NAME="eval-gen"
 fi
 if [ -z "$MODEL_PATH" ]; then
     echo "MODEL_PATH is empty; pass it as the first argument."
@@ -184,7 +176,7 @@ trap 'rc=$?; slack_notify "$rc" "eval"; exit "$rc"' EXIT
 set -eo pipefail
 
 cd "$PROJECT_ROOT/../lm-evaluation-harness"
-pip install -e .
+pip install -e .[ifeval]
 #pip install --upgrade --no-deps "datasets>=2.19.0,<3.0.0"
 
 cd "$PROJECT_ROOT/../lm-evaluation-harness/lm_eval/tasks"
@@ -198,6 +190,8 @@ export HF_DATASETS_TRUST_REMOTE_CODE=1
 export TRITON_CACHE_DIR=$USER_STORAGE/triton
 export HF_DATASETS_CACHE=$HF_HOME/datasets
 unset TRANSFORMERS_CACHE
+# Required on some clusters/PyTorch builds: avoid CUDA init in forked subprocesses.
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 
 export LM_EVAL_INCLUDE_PATH="/users/$USER/lm-evaluation-harness/lm_eval/tasks"
 
@@ -219,7 +213,6 @@ if [ "$DEBUG_FLAG" -eq 1 ]; then
     LIMIT_ARGS=(--limit 100)
 fi
 
-#MODEL_ARGS="pretrained=$MODEL_PATH,dtype=bfloat16,attn_implementation=flash_attention_3,trust_remote_code=True"
 TOKENIZER_ARGS=""
 if [ -f "$MODEL_PATH/config.json" ] && rg -q '"model_type"\s*:\s*"apertus"' "$MODEL_PATH/config.json"; then
     APERTUS_TOKENIZER_PATH="${APERTUS_TOKENIZER_PATH:-$STORAGE_ROOT/apertus/huggingface/swiss-ai/Apertus-8B-Instruct-2509}"
@@ -230,38 +223,41 @@ if [ -f "$MODEL_PATH/config.json" ] && rg -q '"model_type"\s*:\s*"apertus"' "$MO
         echo "Apertus model detected but fallback tokenizer path not found: $APERTUS_TOKENIZER_PATH"
     fi
 fi
-MODEL_ARGS="pretrained=$MODEL_PATH,dtype=bfloat16,attn_implementation=flash_attention_2,trust_remote_code=True$TOKENIZER_ARGS"
+NUM_GPUS="${SLURM_GPUS_ON_NODE:-4}"
+TP_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-$NUM_GPUS}"
+DP_SIZE="${VLLM_DATA_PARALLEL_SIZE:-1}"
+GPU_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
+MODEL_ARGS="pretrained=$MODEL_PATH,dtype=bfloat16,trust_remote_code=True,tensor_parallel_size=$TP_SIZE,data_parallel_size=$DP_SIZE,gpu_memory_utilization=$GPU_MEM_UTIL,max_model_len=$MAX_MODEL_LEN,max_gen_toks=4096,seed=42$TOKENIZER_ARGS"
 
-TASKS="multimedqa"
-
-if [ "$MODEL_PARALLELISM" -eq 1 ]; then
-python3 -m lm_eval \
-  --model hf \
-  --model_args "$MODEL_ARGS,parallelize=True" \
-  --tasks "$TASKS" \
-  --batch_size 16 \
-  --verbosity "DEBUG" \
-  --log_samples \
-  --output_path "$OUTPUT_DIR" \
-  --include_path "$LM_EVAL_INCLUDE_PATH" \
-  --gen_kwargs max_new_tokens=1024 \
-  "${LIMIT_ARGS[@]}" \
-  --apply_chat_template tokenizer_default 
-else
-accelerate launch --num_processes 4 --num_machines 1 --mixed_precision bf16 --dynamo_backend no -m lm_eval \
-  --model hf \
-  --model_args "$MODEL_ARGS" \
-  --tasks "$TASKS" \
-  --batch_size 16 \
-  --verbosity "DEBUG" \
-  --log_samples \
-  --output_path "$OUTPUT_DIR" \
-  --include_path "$LM_EVAL_INCLUDE_PATH" \
-  --gen_kwargs max_new_tokens=1024 \
-  "${LIMIT_ARGS[@]}" \
-  --apply_chat_template tokenizer_default 
+# =========================================================
+# NEW: W&B Linking Logic 
+# =========================================================
+WANDB_CLI_ARGS=""
+if [ -n "$WANDB_RUN_ID" ] && [ -n "$WANDB_PROJECT" ]; then
+    echo "🔗 Linking eval to W&B Training Run ID: $WANDB_RUN_ID in Project: $WANDB_PROJECT"
+    # Setting WANDB_RESUME=allow tells the W&B client it's okay to append to an existing run
+    export WANDB_RESUME="allow"
+    # Pass args directly to lm_eval's integration
+    WANDB_CLI_ARGS="--wandb_args project=$WANDB_PROJECT,id=$WANDB_RUN_ID,resume=allow"
 fi
+# =========================================================
+
+python3 -m lm_eval \
+  --model vllm \
+  --model_args "$MODEL_ARGS" \
+  --tasks medbench \
+  --batch_size auto \
+  --verbosity "DEBUG" \
+  --log_samples \
+  --output_path "$OUTPUT_DIR" \
+  --include_path "$LM_EVAL_INCLUDE_PATH" \
+  --gen_kwargs temperature=0.0 \
+  --seed 42 \
+  "${LIMIT_ARGS[@]}" \
+  --apply_chat_template tokenizer_default \
+  $WANDB_CLI_ARGS
 
 echo "END TIME: $(date)"
 
-#pubmedqa,medmcqa,medqa_4options,pubmedqa_g,medmcqa_g,medqa_g,medxpertqa,medxpertqa_g,mmlu_flan_cot_zeroshot
+#pubmedqa,medmcqa,medqa_4options,pubmedqa_g,medmcqa_g,medqa_g,medxpertqa,medxpertqa_g,mmlu_flan_cot_zeroshot, medbench
